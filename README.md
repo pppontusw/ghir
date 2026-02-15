@@ -151,3 +151,7 @@ make run ARGS="--help"
   - Run `gh auth status` and confirm repo access.
 - `ERROR: uncommitted changes detected`
   - Commit or stash local changes before running.
+
+## License
+
+MIT, see `LICENSE`.
