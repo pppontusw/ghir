@@ -345,6 +345,61 @@ func TestParseArgsInvalidAgent(t *testing.T) {
 	}
 }
 
+func TestIssueMentionedInSubjects(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		subjects string
+		issue    string
+		want     bool
+	}{
+		{
+			name:     "single subject matches issue",
+			subjects: "feat: implement thing (closes #1)",
+			issue:    "1",
+			want:     true,
+		},
+		{
+			name: "multi-commit range contains issue reference",
+			subjects: strings.Join([]string{
+				"fix: remove python cache artifacts from backend scaffold",
+				"feat: scaffold backend and compose foundation (closes #1)",
+			}, "\n"),
+			issue: "1",
+			want:  true,
+		},
+		{
+			name:     "issue one does not match issue ten",
+			subjects: "feat: closes #10",
+			issue:    "1",
+			want:     false,
+		},
+		{
+			name:     "empty issue never matches",
+			subjects: "feat: closes #1",
+			issue:    "",
+			want:     false,
+		},
+		{
+			name:     "no subject mentions issue",
+			subjects: "chore: cleanup",
+			issue:    "1",
+			want:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := issueMentionedInSubjects(tt.subjects, tt.issue); got != tt.want {
+				t.Fatalf("issueMentionedInSubjects() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDetectSessionLimitByAgent(t *testing.T) {
 	t.Parallel()
 

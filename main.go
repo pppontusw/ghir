@@ -649,6 +649,12 @@ func (r *runner) processIssue(idx, total int, issue string) issueResult {
 		return resultFailed
 	}
 
+	startHead, err := r.gitOutput("rev-parse", "HEAD")
+	if err != nil {
+		r.printf(r.colors.Red, "FAILED: cannot determine pre-run git HEAD: %v\n", err)
+		return resultFailed
+	}
+
 	prompt, err := r.buildPrompt(issue, details)
 	if err != nil {
 		r.printf(r.colors.Red, "FAILED: cannot build prompt for #%s: %v\n", issue, err)
@@ -688,14 +694,28 @@ func (r *runner) processIssue(idx, total int, issue string) issueResult {
 		return resultFailed
 	}
 
-	headMsg, err := r.gitOutput("log", "-1", "--pretty=format:%s")
-	if err == nil && strings.Contains(headMsg, "#"+issue) {
+	endHead, err := r.gitOutput("rev-parse", "HEAD")
+	if err != nil {
+		r.printf(r.colors.Red, "FAILED: cannot determine post-run git HEAD: %v\n", err)
+		return resultFailed
+	}
+
+	if endHead != startHead {
+		headMsg, _ := r.gitOutput("log", "-1", "--pretty=format:%s")
+		rangeSubjects, rangeErr := r.gitOutput("log", "--pretty=format:%s", fmt.Sprintf("%s..%s", startHead, endHead))
+		hasIssueRef := rangeErr == nil && issueMentionedInSubjects(rangeSubjects, issue)
+
 		if err := r.markCompleted(issue); err != nil {
 			r.printf(r.colors.Red, "FAILED: could not mark #%s completed: %v\n", issue, err)
 			return resultFailed
 		}
 		r.printf(r.colors.Green, "SUCCESS: Issue #%s committed by %s\n", issue, agentDisplayName(r.opts.Agent))
-		r.printf(r.colors.Green, "Commit: %s\n", headMsg)
+		if strings.TrimSpace(headMsg) != "" {
+			r.printf(r.colors.Green, "Commit: %s\n", headMsg)
+		}
+		if !hasIssueRef {
+			r.printf(r.colors.Yellow, "WARNING: new commit(s) do not mention #%s in subject lines.\n", issue)
+		}
 		fmt.Println()
 		return resultSuccess
 	}
@@ -727,6 +747,31 @@ func (r *runner) processIssue(idx, total int, issue string) issueResult {
 	r.printf(r.colors.Red, "FAILED: no changes produced for issue #%s\n", issue)
 	r.printf(r.colors.Red, "%s ran but made no modifications. Check log: %s\n", agentDisplayName(r.opts.Agent), logPath)
 	return resultFailed
+}
+
+func issueMentionedInSubjects(subjects, issue string) bool {
+	if issue == "" {
+		return false
+	}
+
+	needle := "#" + issue
+	for _, subject := range strings.Split(subjects, "\n") {
+		start := 0
+		for {
+			offset := strings.Index(subject[start:], needle)
+			if offset == -1 {
+				break
+			}
+			idx := start + offset
+			after := idx + len(needle)
+			if after >= len(subject) || subject[after] < '0' || subject[after] > '9' {
+				return true
+			}
+			start = after
+		}
+	}
+
+	return false
 }
 
 func (r *runner) fetchIssueDetails(issue string) (issueDetails, error) {
