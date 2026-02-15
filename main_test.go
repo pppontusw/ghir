@@ -92,6 +92,63 @@ func TestParseArgsModelParsing(t *testing.T) {
 	}
 }
 
+func TestParseArgsStreamView(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		args      []string
+		wantView  string
+		wantError string
+	}{
+		{
+			name:     "default stream view is pretty",
+			args:     []string{},
+			wantView: streamViewPretty,
+		},
+		{
+			name:     "explicit pretty",
+			args:     []string{"--stream-view", "pretty"},
+			wantView: streamViewPretty,
+		},
+		{
+			name:     "explicit raw",
+			args:     []string{"--stream-view", "raw"},
+			wantView: streamViewRaw,
+		},
+		{
+			name:      "invalid stream view",
+			args:      []string{"--stream-view", "minimal"},
+			wantError: "--stream-view must be one of: pretty, raw",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			opts, err := parseArgs(tt.args)
+			if tt.wantError != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.wantError)
+				}
+				if !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("unexpected error: got %q want substring %q", err.Error(), tt.wantError)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("parseArgs returned unexpected error: %v", err)
+			}
+			if opts.StreamView != tt.wantView {
+				t.Fatalf("stream view mismatch: got %q want %q", opts.StreamView, tt.wantView)
+			}
+		})
+	}
+}
+
 func TestParseArgsIssueAndResetValidation(t *testing.T) {
 	t.Parallel()
 
@@ -685,6 +742,132 @@ func TestWaitDurationGemini(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNewStreamRenderer(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		agent            string
+		streamView       string
+		wantCodexPretty  bool
+		wantRaw          bool
+		wantNoticeSubstr string
+	}{
+		{
+			name:            "codex pretty renderer for codex pretty view",
+			agent:           "codex",
+			streamView:      streamViewPretty,
+			wantCodexPretty: true,
+		},
+		{
+			name:       "raw renderer for raw view",
+			agent:      "codex",
+			streamView: streamViewRaw,
+			wantRaw:    true,
+		},
+		{
+			name:             "non-codex pretty falls back to raw with notice",
+			agent:            "gemini",
+			streamView:       streamViewPretty,
+			wantRaw:          true,
+			wantNoticeSubstr: "not implemented",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := &runner{
+				opts: options{
+					Agent:      tt.agent,
+					StreamView: tt.streamView,
+				},
+			}
+
+			gotRenderer, gotNotice := r.newStreamRenderer()
+			if tt.wantCodexPretty {
+				if _, ok := gotRenderer.(*codexPrettyRenderer); !ok {
+					t.Fatalf("renderer type mismatch: got %T want *codexPrettyRenderer", gotRenderer)
+				}
+			}
+			if tt.wantRaw {
+				if _, ok := gotRenderer.(*rawStreamRenderer); !ok {
+					t.Fatalf("renderer type mismatch: got %T want *rawStreamRenderer", gotRenderer)
+				}
+			}
+			if tt.wantNoticeSubstr == "" {
+				if gotNotice != "" {
+					t.Fatalf("expected no notice, got %q", gotNotice)
+				}
+				return
+			}
+			if !strings.Contains(gotNotice, tt.wantNoticeSubstr) {
+				t.Fatalf("notice mismatch: got %q want substring %q", gotNotice, tt.wantNoticeSubstr)
+			}
+		})
+	}
+}
+
+func TestCodexPrettyRenderer(t *testing.T) {
+	t.Parallel()
+
+	renderer := &codexPrettyRenderer{}
+
+	t.Run("shows command start", func(t *testing.T) {
+		t.Parallel()
+		got := renderer.ConsumeLine(`{"type":"item.started","item":{"type":"command_execution","command":"echo hello"}}`)
+		if len(got) != 1 || got[0] != "[cmd] echo hello" {
+			t.Fatalf("unexpected output: %v", got)
+		}
+	})
+
+	t.Run("suppresses successful command completion", func(t *testing.T) {
+		t.Parallel()
+		got := renderer.ConsumeLine(`{"type":"item.completed","item":{"type":"command_execution","command":"echo hello","status":"completed","exit_code":0}}`)
+		if len(got) != 0 {
+			t.Fatalf("expected no output, got %v", got)
+		}
+	})
+
+	t.Run("shows failed command completion", func(t *testing.T) {
+		t.Parallel()
+		got := renderer.ConsumeLine(`{"type":"item.completed","item":{"type":"command_execution","command":"/bin/sh -lc \"exit 1\"","status":"failed","exit_code":1,"aggregated_output":"line 1\nline 2"}}`)
+		if len(got) < 2 {
+			t.Fatalf("expected multiline output, got %v", got)
+		}
+		if !strings.Contains(got[0], "[cmd failed exit=1]") {
+			t.Fatalf("missing failure header: %v", got)
+		}
+		if !strings.Contains(got[1], "line 1") {
+			t.Fatalf("missing output snippet: %v", got)
+		}
+	})
+
+	t.Run("shows assistant message", func(t *testing.T) {
+		t.Parallel()
+		got := renderer.ConsumeLine(`{"type":"item.completed","item":{"type":"agent_message","text":"hello\nworld"}}`)
+		if len(got) != 2 {
+			t.Fatalf("unexpected line count: %v", got)
+		}
+		if got[0] != "[assistant] hello" {
+			t.Fatalf("unexpected first line: %q", got[0])
+		}
+		if got[1] != "  world" {
+			t.Fatalf("unexpected second line: %q", got[1])
+		}
+	})
+
+	t.Run("passes non-json lines through", func(t *testing.T) {
+		t.Parallel()
+		got := renderer.ConsumeLine("plain text output")
+		if len(got) != 1 || got[0] != "plain text output" {
+			t.Fatalf("unexpected output: %v", got)
+		}
+	})
 }
 
 func TestMainInvalidFlagsExitNonZero(t *testing.T) {

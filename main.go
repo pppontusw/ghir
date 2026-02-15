@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,6 +24,8 @@ const (
 	defaultFallbackWaitSec   = 1800
 	defaultSessionBufferSec  = 120
 	countdownIntervalSeconds = 300
+	streamViewPretty         = "pretty"
+	streamViewRaw            = "raw"
 )
 
 var (
@@ -55,6 +58,7 @@ type options struct {
 	GeminiBin      string
 	CursorBin      string
 	GHBin          string
+	StreamView     string
 	NoColor        bool
 	Help           bool
 	WaitBufferSec  int
@@ -181,6 +185,7 @@ func parseArgs(args []string) (options, error) {
 		GeminiBin:     "gemini",
 		CursorBin:     "cursor-agent",
 		GHBin:         "gh",
+		StreamView:    streamViewPretty,
 		WaitBufferSec: defaultSessionBufferSec,
 	}
 
@@ -301,6 +306,13 @@ func parseArgs(args []string) (options, error) {
 			}
 			opts.WaitBufferSec = waitSec
 			i = next
+		case "--stream-view":
+			val, next, err := requireValue(arg, args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.StreamView = strings.ToLower(val)
+			i = next
 		case "--no-color":
 			opts.NoColor = true
 		case "-h", "--help":
@@ -318,6 +330,9 @@ func parseArgs(args []string) (options, error) {
 	}
 	if opts.Agent != "claude" && opts.Agent != "codex" && opts.Agent != "gemini" && opts.Agent != "cursor-agent" {
 		return opts, fmt.Errorf("--agent must be one of: claude, codex, gemini, cursor-agent")
+	}
+	if opts.StreamView != streamViewPretty && opts.StreamView != streamViewRaw {
+		return opts, fmt.Errorf("--stream-view must be one of: %s, %s", streamViewPretty, streamViewRaw)
 	}
 
 	return opts, nil
@@ -357,6 +372,7 @@ Options:
   --gemini-bin <name/path>      Gemini CLI command (default: gemini)
   --cursor-bin <name/path>      Cursor-agent CLI command (default: cursor-agent)
   --gh-bin <name/path>          GitHub CLI command (default: gh)
+  --stream-view <pretty|raw>    Console streaming view (default: pretty)
   --wait-buffer-sec <seconds>   Extra wait seconds after reset time (default: 120)
   --no-color                    Disable ANSI colors
   -h, --help                    Show this help
@@ -609,6 +625,7 @@ func (r *runner) printBanner(issues []string) {
 	if r.opts.Model != "" {
 		r.printf(r.colors.Blue, "Model override: %s\n", r.opts.Model)
 	}
+	r.printf(r.colors.Blue, "Stream view: %s\n", r.opts.StreamView)
 	r.printf(r.colors.Blue, "Total: %d | Completed: %d | Remaining: %d\n", len(issues), completed, remaining)
 	r.printf(r.colors.Blue, "============================================================\n")
 	fmt.Println()
@@ -819,7 +836,19 @@ func (r *runner) runAgent(prompt, logPath string) (int, string, error) {
 		_ = logFile.Close()
 	}()
 
-	output := io.MultiWriter(os.Stdout, logFile)
+	renderer, notice := r.newStreamRenderer()
+	if notice != "" {
+		r.printf(r.colors.Yellow, "%s\n", notice)
+	}
+
+	var output io.Writer
+	var consoleWriter *consoleStreamWriter
+	if r.opts.StreamView == streamViewPretty && r.opts.Agent == "codex" {
+		consoleWriter = newConsoleStreamWriter(os.Stdout, renderer)
+		output = io.MultiWriter(logFile, consoleWriter)
+	} else {
+		output = io.MultiWriter(logFile, os.Stdout)
+	}
 	cmd, err := r.buildAgentCommand(prompt)
 	if err != nil {
 		return 0, "", err
@@ -838,6 +867,11 @@ func (r *runner) runAgent(prompt, logPath string) (int, string, error) {
 			return 0, "", fmt.Errorf("start %s: %w", r.opts.Agent, err)
 		}
 	}
+	if consoleWriter != nil {
+		if flushErr := consoleWriter.Flush(); flushErr != nil {
+			return exitCode, "", fmt.Errorf("flush stream output: %w", flushErr)
+		}
+	}
 
 	if syncErr := logFile.Sync(); syncErr != nil {
 		return exitCode, "", fmt.Errorf("sync log file: %w", syncErr)
@@ -848,6 +882,311 @@ func (r *runner) runAgent(prompt, logPath string) (int, string, error) {
 	}
 
 	return exitCode, string(data), nil
+}
+
+type streamRenderer interface {
+	ConsumeLine(line string) []string
+	FinalLines() []string
+}
+
+type rawStreamRenderer struct{}
+
+func (r *rawStreamRenderer) ConsumeLine(line string) []string {
+	return []string{line}
+}
+
+func (r *rawStreamRenderer) FinalLines() []string {
+	return nil
+}
+
+type codexPrettyRenderer struct{}
+
+func (r *codexPrettyRenderer) ConsumeLine(line string) []string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return nil
+	}
+	if !strings.HasPrefix(trimmed, "{") {
+		return []string{line}
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &payload); err != nil {
+		return []string{line}
+	}
+
+	eventType, _ := payload["type"].(string)
+	switch eventType {
+	case "item.started":
+		item := asAnyMap(payload["item"])
+		if item == nil || getStringField(item, "type") != "command_execution" {
+			return nil
+		}
+		cmd := truncateForConsole(normalizeWhitespace(getStringField(item, "command")), 120)
+		if cmd == "" {
+			return []string{"[cmd] started"}
+		}
+		return []string{fmt.Sprintf("[cmd] %s", cmd)}
+	case "item.completed":
+		item := asAnyMap(payload["item"])
+		if item == nil {
+			return nil
+		}
+
+		switch getStringField(item, "type") {
+		case "command_execution":
+			exitCode, hasExitCode := getIntField(item, "exit_code")
+			status := strings.ToLower(getStringField(item, "status"))
+			if (hasExitCode && exitCode == 0 && (status == "" || status == "completed")) ||
+				(!hasExitCode && status == "completed") {
+				return nil
+			}
+
+			cmd := truncateForConsole(normalizeWhitespace(getStringField(item, "command")), 120)
+			header := "[cmd failed]"
+			if hasExitCode {
+				header = fmt.Sprintf("[cmd failed exit=%d]", exitCode)
+			}
+			if status != "" {
+				header += " status=" + status
+			}
+
+			var lines []string
+			if cmd != "" {
+				lines = append(lines, fmt.Sprintf("%s %s", header, cmd))
+			} else {
+				lines = append(lines, header)
+			}
+
+			aggregatedOutput := strings.TrimSpace(getStringField(item, "aggregated_output"))
+			for _, outputLine := range compactMultiline(aggregatedOutput, 4, 360) {
+				lines = append(lines, "  "+outputLine)
+			}
+			return lines
+		case "agent_message":
+			text := strings.TrimSpace(getStringField(item, "text"))
+			if text == "" {
+				return nil
+			}
+			return prefixMultiline("[assistant] ", "  ", text)
+		default:
+			return nil
+		}
+	case "error":
+		code := getStringField(payload, "code")
+		message := strings.TrimSpace(getStringField(payload, "message"))
+		switch {
+		case code != "" && message != "":
+			return []string{fmt.Sprintf("[error] %s: %s", code, message)}
+		case message != "":
+			return []string{"[error] " + message}
+		case code != "":
+			return []string{"[error] " + code}
+		default:
+			return []string{"[error] received error event"}
+		}
+	case "turn.completed":
+		return []string{"[done] turn completed"}
+	default:
+		return nil
+	}
+}
+
+func (r *codexPrettyRenderer) FinalLines() []string {
+	return nil
+}
+
+type consoleStreamWriter struct {
+	out      io.Writer
+	renderer streamRenderer
+	pending  []byte
+	mu       sync.Mutex
+}
+
+func newConsoleStreamWriter(out io.Writer, renderer streamRenderer) *consoleStreamWriter {
+	return &consoleStreamWriter{
+		out:      out,
+		renderer: renderer,
+	}
+}
+
+func (w *consoleStreamWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.pending = append(w.pending, p...)
+	for {
+		newlineIndex := bytes.IndexByte(w.pending, '\n')
+		if newlineIndex < 0 {
+			break
+		}
+
+		lineBytes := w.pending[:newlineIndex]
+		if len(lineBytes) > 0 && lineBytes[len(lineBytes)-1] == '\r' {
+			lineBytes = lineBytes[:len(lineBytes)-1]
+		}
+		if err := w.emitLineLocked(string(lineBytes)); err != nil {
+			return 0, err
+		}
+
+		w.pending = w.pending[newlineIndex+1:]
+	}
+
+	return len(p), nil
+}
+
+func (w *consoleStreamWriter) Flush() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if len(w.pending) > 0 {
+		remaining := w.pending
+		if len(remaining) > 0 && remaining[len(remaining)-1] == '\r' {
+			remaining = remaining[:len(remaining)-1]
+		}
+		if err := w.emitLineLocked(string(remaining)); err != nil {
+			return err
+		}
+		w.pending = nil
+	}
+
+	for _, line := range w.renderer.FinalLines() {
+		if _, err := fmt.Fprintln(w.out, line); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *consoleStreamWriter) emitLineLocked(line string) error {
+	for _, formattedLine := range w.renderer.ConsumeLine(line) {
+		if _, err := fmt.Fprintln(w.out, formattedLine); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *runner) newStreamRenderer() (streamRenderer, string) {
+	if r.opts.StreamView == streamViewRaw {
+		return &rawStreamRenderer{}, ""
+	}
+	if r.opts.Agent == "codex" {
+		return &codexPrettyRenderer{}, ""
+	}
+	return &rawStreamRenderer{}, fmt.Sprintf(
+		"Stream view %q is not implemented for %s yet; showing raw output.",
+		r.opts.StreamView,
+		agentDisplayName(r.opts.Agent),
+	)
+}
+
+func asAnyMap(value any) map[string]any {
+	m, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	return m
+}
+
+func getStringField(fields map[string]any, key string) string {
+	if fields == nil {
+		return ""
+	}
+	value, ok := fields[key]
+	if !ok || value == nil {
+		return ""
+	}
+	text, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return text
+}
+
+func getIntField(fields map[string]any, key string) (int, bool) {
+	if fields == nil {
+		return 0, false
+	}
+
+	value, ok := fields[key]
+	if !ok || value == nil {
+		return 0, false
+	}
+
+	switch v := value.(type) {
+	case int:
+		return v, true
+	case int32:
+		return int(v), true
+	case int64:
+		return int(v), true
+	case float64:
+		return int(v), true
+	case json.Number:
+		n, err := strconv.Atoi(v.String())
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	default:
+		return 0, false
+	}
+}
+
+func normalizeWhitespace(value string) string {
+	return strings.Join(strings.Fields(value), " ")
+}
+
+func truncateForConsole(value string, maxLen int) string {
+	if maxLen <= 0 || len(value) <= maxLen {
+		return value
+	}
+	if maxLen <= 3 {
+		return value[:maxLen]
+	}
+	return value[:maxLen-3] + "..."
+}
+
+func compactMultiline(value string, maxLines int, maxChars int) []string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+
+	if maxChars > 0 && len(trimmed) > maxChars {
+		trimmed = truncateForConsole(trimmed, maxChars)
+	}
+
+	lines := strings.Split(trimmed, "\n")
+	if maxLines > 0 && len(lines) > maxLines {
+		lines = append(lines[:maxLines], "...")
+	}
+
+	for i := range lines {
+		lines[i] = strings.TrimSpace(lines[i])
+	}
+	return lines
+}
+
+func prefixMultiline(firstPrefix, nextPrefix, value string) []string {
+	lines := strings.Split(strings.TrimSpace(value), "\n")
+	if len(lines) == 0 {
+		return nil
+	}
+	for i := range lines {
+		lines[i] = strings.TrimRight(lines[i], "\r")
+	}
+
+	var formatted []string
+	for idx, line := range lines {
+		if idx == 0 {
+			formatted = append(formatted, firstPrefix+line)
+			continue
+		}
+		formatted = append(formatted, nextPrefix+line)
+	}
+	return formatted
 }
 
 func (r *runner) buildAgentCommand(prompt string) (*exec.Cmd, error) {

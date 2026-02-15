@@ -86,6 +86,10 @@ ghir --issue 1710
 # Reprocess already completed issues
 ghir --force
 
+# Control live console rendering
+ghir --agent codex --stream-view pretty   # default
+ghir --stream-view raw
+
 # Reset completion state
 ghir --reset
 ghir --reset 1710
@@ -113,6 +117,11 @@ Flag mapping:
 - Codex: `--model`
 - Gemini: `-m`
 - Cursor Agent: `--model`
+
+Streaming view:
+- `--stream-view pretty` (default): condensed event rendering for Codex JSON output.
+- `--stream-view raw`: passthrough raw agent output to console.
+- For non-Codex agents, `pretty` currently falls back to raw passthrough with a notice.
 
 ## State and Logs
 
