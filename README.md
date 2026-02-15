@@ -1,62 +1,153 @@
-# ticket-runner
+# ghir
 
-Go rewrite of `run-tickets.sh` so you can build one binary and run it from any git repository.
+Queue-driven GitHub issue runner for agent CLIs (`claude`, `codex`, `gemini`, `cursor-agent`).
 
-## Build
+It processes issues one-by-one in a controlled order, stores completion state per repository, writes logs per issue, and supports agent/model overrides.
+
+## Prerequisites
+
+- Go 1.22+
+- `git`
+- `gh` (authenticated with access to your repo/issues)
+- At least one agent CLI in `PATH`:
+  - `claude`
+  - `codex`
+  - `gemini`
+  - `cursor-agent`
+
+## Quick Start
+
+### 1) Install the binary
+
+From this repo:
 
 ```bash
-go build -o ticket-runner .
+make install
 ```
 
-Or install globally:
+By default this installs to `~/.local/bin/ghir`.
+
+If `ghir` is not found, add this to `~/.zshrc`:
 
 ```bash
-go install .
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-## Repository setup
+Then reload shell:
 
-In each target repository, create `.ticket-runner/issues.txt`:
+```bash
+source ~/.zshrc
+```
+
+Verify:
+
+```bash
+ghir --help
+```
+
+### 2) Configure a target repository
+
+In the repo where you want to run tickets, create `.ticket-runner/issues.txt`:
 
 ```text
-# one issue id per line
+# one issue id per line (processing order)
 1721
 1706
 1710
 ```
 
-Optional: create `.ticket-runner/prompt.tmpl` to override the default prompt. Available placeholders:
+Optional prompt override: `.ticket-runner/prompt.tmpl`.
 
+Template placeholders:
 - `{{ISSUE_NUMBER}}`
 - `{{ISSUE_TITLE}}`
 - `{{ISSUE_BODY}}`
 
-## Usage
+### 3) First run
 
 ```bash
-ticket-runner --dry-run
-ticket-runner --status
-ticket-runner --issue 1710
-ticket-runner --force
-ticket-runner --reset
-ticket-runner --reset 1710
-ticket-runner --issues 1721,1706,1710
-ticket-runner --agent codex --issues 1721,1706
-ticket-runner --agent gemini --issues 1721,1706
-ticket-runner --agent cursor-agent --issues 1721,1706
-ticket-runner --agent claude --model sonnet --issues 1721,1706
+cd /path/to/target-repo
+ghir --dry-run
+ghir
 ```
 
-## Notes
+## Common Commands
 
-- The tool must run inside a git repository.
-- Logs are written to `.ticket-runs/<issue>.log`.
-- Completion tracking is stored in `.ticket-runs/.completed`.
-- For `claude`, `codex`, and `gemini`, usage/session limits trigger wait-and-retry.
-- For `cursor-agent`, monthly quota/resource exhaustion is treated as non-retryable.
-- `--agent` supports `claude` (default), `codex`, `gemini`, and `cursor-agent`.
-- `--model` applies a direct model override and maps to each CLI's native flag:
-  - Claude: `--model`
-  - Codex: `--model`
-  - Gemini: `-m`
-  - Cursor Agent: `--model`
+```bash
+# Show queue state
+ghir --status
+
+# Process specific issues without creating issues.txt
+ghir --issues 1721,1706
+
+# Process one issue (forced re-run of that issue)
+ghir --issue 1710
+
+# Reprocess already completed issues
+ghir --force
+
+# Reset completion state
+ghir --reset
+ghir --reset 1710
+```
+
+## Agent and Model Selection
+
+`--agent` supports:
+- `claude` (default)
+- `codex`
+- `gemini`
+- `cursor-agent`
+
+Use `--model` to override model per run:
+
+```bash
+ghir --agent claude --model sonnet --issues 1721,1706
+ghir --agent codex --model gpt-5.3-codex --issues 1721,1706
+ghir --agent gemini --model gemini-3-pro-preview --issues 1721,1706
+ghir --agent cursor-agent --model auto --issues 1721,1706
+```
+
+Flag mapping:
+- Claude: `--model`
+- Codex: `--model`
+- Gemini: `-m`
+- Cursor Agent: `--model`
+
+## State and Logs
+
+For each target repository:
+
+- Logs: `.ticket-runs/<issue>.log`
+- Completion file: `.ticket-runs/.completed`
+
+This means progress is isolated per repo.
+
+## Safety and Failure Behavior
+
+- Must run inside a git repository.
+- Requires clean working tree before processing each issue.
+- Stops on first non-retryable failure.
+- Retries with wait on session/usage limits for:
+  - `claude`
+  - `codex`
+  - `gemini`
+- `cursor-agent` monthly quota/resource exhaustion is treated as non-retryable.
+
+## Development Commands
+
+```bash
+make help
+make build
+make install
+make run ARGS="--help"
+```
+
+## Troubleshooting
+
+- `ghir: command not found`
+  - Ensure `~/.local/bin` is in `PATH`.
+- `gh issue view ...` failures
+  - Run `gh auth status` and confirm repo access.
+- `ERROR: uncommitted changes detected`
+  - Commit or stash local changes before running.
