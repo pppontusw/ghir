@@ -334,7 +334,7 @@ func requireValue(flag string, args []string, idx int) (string, int, error) {
 }
 
 func printUsage() {
-	fmt.Println(`Ticket runner
+	fmt.Print(`Ticket runner
 
 Usage:
   ticket-runner [options]
@@ -665,7 +665,7 @@ func (r *runner) processIssue(idx, total int, issue string) issueResult {
 		return resultFailed
 	}
 
-	if detectSessionLimit(logOutput, r.opts.Agent) {
+	if detectSessionLimit(logOutput, r.opts.Agent, exitCode) {
 		if dirtyNow, dirtyErr := r.workingTreeDirty(); dirtyErr == nil && dirtyNow {
 			r.printf(r.colors.Yellow, "Session limit hit mid-work. Committing partial progress...\n")
 			message := fmt.Sprintf(
@@ -1038,8 +1038,14 @@ func waitDurationGemini(logOutput string, now time.Time, bufferSec int) (int, ti
 	return wait, now.Add(time.Duration(wait) * time.Second)
 }
 
-func detectSessionLimit(logOutput, agent string) bool {
+func detectSessionLimit(logOutput, agent string, exitCode int) bool {
 	if agent == "codex" {
+		if detectCodexErrorEventLimit(logOutput) {
+			return true
+		}
+		if exitCode == 0 {
+			return false
+		}
 		lower := strings.ToLower(logOutput)
 		if strings.Contains(lower, "usage_limit_reached") {
 			return true
@@ -1054,12 +1060,89 @@ func detectSessionLimit(logOutput, agent string) bool {
 		return false
 	}
 	if agent == "gemini" {
+		if detectGeminiErrorPayloadLimit(logOutput) {
+			return true
+		}
+		if exitCode == 0 {
+			return false
+		}
 		return geminiSessionLimitPattern.MatchString(logOutput)
 	}
 	if agent == "cursor-agent" {
 		return false
 	}
 	return claudeSessionLimitPattern.MatchString(logOutput)
+}
+
+func detectCodexErrorEventLimit(logOutput string) bool {
+	for _, raw := range strings.Split(logOutput, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || !strings.HasPrefix(line, "{") {
+			continue
+		}
+
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(line), &payload); err != nil {
+			continue
+		}
+
+		eventType, _ := payload["type"].(string)
+		if eventType != "error" {
+			continue
+		}
+
+		if code, ok := payload["code"].(string); ok {
+			lowerCode := strings.ToLower(code)
+			if strings.Contains(lowerCode, "usage_limit_reached") || strings.Contains(lowerCode, "usage limit") {
+				return true
+			}
+		}
+
+		if message, ok := payload["message"].(string); ok {
+			lowerMessage := strings.ToLower(message)
+			if strings.Contains(lowerMessage, "usage_limit_reached") || strings.Contains(lowerMessage, "usage limit") {
+				return true
+			}
+		}
+
+		if _, hasReset := payload["resets_at"]; hasReset {
+			return true
+		}
+	}
+	return false
+}
+
+func detectGeminiErrorPayloadLimit(logOutput string) bool {
+	for _, raw := range strings.Split(logOutput, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || !strings.HasPrefix(line, "{") {
+			continue
+		}
+
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(line), &payload); err != nil {
+			continue
+		}
+
+		isError, ok := payload["is_error"].(bool)
+		if !ok || !isError {
+			continue
+		}
+
+		var messageParts []string
+		if result, ok := payload["result"].(string); ok {
+			messageParts = append(messageParts, result)
+		}
+		if message, ok := payload["message"].(string); ok {
+			messageParts = append(messageParts, message)
+		}
+
+		combined := strings.Join(messageParts, " ")
+		if geminiSessionLimitPattern.MatchString(combined) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseGeminiDurationSeconds(durationText string) int {
