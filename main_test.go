@@ -199,9 +199,10 @@ func TestParseArgsIssueAndResetValidation(t *testing.T) {
 			wantForce: true,
 		},
 		{
-			name:    "reset issue must be numeric",
-			args:    []string{"--reset", "bad"},
-			wantErr: `--reset issue must be numeric: "bad"`,
+			name:           "reset with non-numeric value (file path)",
+			args:           []string{"--reset", "tasks/foo.md"},
+			wantReset:      true,
+			wantResetIssue: "tasks/foo.md",
 		},
 	}
 
@@ -338,6 +339,177 @@ func TestParseCSVIssuesValidation(t *testing.T) {
 			}
 			if !slices.Equal(got, tt.want) {
 				t.Fatalf("issues mismatch: got %v want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseArgsAllOpen(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		args      []string
+		want      bool
+		wantLabel string
+		wantErr   string
+	}{
+		{
+			name: "flag present",
+			args: []string{"--all-open"},
+			want: true,
+		},
+		{
+			name:      "flag and label present",
+			args:      []string{"--all-open", "--label", "ghir"},
+			want:      true,
+			wantLabel: "ghir",
+		},
+		{
+			name:      "label present without all-open",
+			args:      []string{"--label", "bug"},
+			want:      false,
+			wantLabel: "bug",
+		},
+		{
+			name: "flag absent",
+			args: []string{},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			opts, err := parseArgs(tt.args)
+			if err != nil {
+				t.Fatalf("parseArgs returned unexpected error: %v", err)
+			}
+			if opts.AllOpen != tt.want {
+				t.Fatalf("AllOpen mismatch: got %v want %v", opts.AllOpen, tt.want)
+			}
+			if opts.Label != tt.wantLabel {
+				t.Fatalf("Label mismatch: got %v want %v", opts.Label, tt.wantLabel)
+			}
+		})
+	}
+}
+
+func TestParseArgsVersion(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{
+			name: "version flag present",
+			args: []string{"--version"},
+			want: true,
+		},
+		{
+			name: "version flag absent",
+			args: []string{},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			opts, err := parseArgs(tt.args)
+			if err != nil {
+				t.Fatalf("parseArgs returned unexpected error: %v", err)
+			}
+			if opts.Version != tt.want {
+				t.Fatalf("Version mismatch: got %v want %v", opts.Version, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseArgsContinueOnError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{
+			name: "flag present",
+			args: []string{"--continue-on-error"},
+			want: true,
+		},
+		{
+			name: "flag absent",
+			args: []string{},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			opts, err := parseArgs(tt.args)
+			if err != nil {
+				t.Fatalf("parseArgs returned unexpected error: %v", err)
+			}
+			if opts.ContinueOnError != tt.want {
+				t.Fatalf("ContinueOnError mismatch: got %v want %v", opts.ContinueOnError, tt.want)
+			}
+		})
+	}
+}
+
+func TestSortStringsNumeric(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input []string
+		want  []string
+	}{
+		{
+			name:  "mixed numeric",
+			input: []string{"10", "1", "2"},
+			want:  []string{"1", "2", "10"},
+		},
+		{
+			name:  "mixed alphanumeric",
+			input: []string{"a", "10", "1", "b"},
+			want:  []string{"1", "10", "a", "b"},
+		},
+		{
+			name:  "already sorted",
+			input: []string{"1", "2", "3"},
+			want:  []string{"1", "2", "3"},
+		},
+		{
+			name:  "reverse sorted",
+			input: []string{"3", "2", "1"},
+			want:  []string{"1", "2", "3"},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := make([]string, len(tt.input))
+			copy(got, tt.input)
+			sortStringsNumeric(got)
+
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("sortStringsNumeric mismatch: got %v want %v", got, tt.want)
 			}
 		})
 	}
@@ -517,6 +689,27 @@ func TestDetectSessionLimitByAgent(t *testing.T) {
 			retry:    true,
 		},
 		{
+			name:     "gemini retryable for no capacity 429",
+			agent:    "gemini",
+			log:      "RetryableQuotaError: No capacity available for model gemini-3-pro-preview on the server\n  cause: { code: 429 }",
+			exitCode: 1,
+			retry:    true,
+		},
+		{
+			name:     "gemini retryable for 429 capacity in stack trace and JSON",
+			agent:    "gemini",
+			log:      "cause: { code: 429, message: 'No capacity available for model gemini-3-pro-preview on the server' }\n{\"session_id\":\"x\",\"error\":{\"message\":\"[object Object]\",\"code\":1}}",
+			exitCode: 1,
+			retry:    true,
+		},
+		{
+			name:     "gemini retryable for real GaxiosError log with MODEL_CAPACITY_EXHAUSTED",
+			agent:    "gemini",
+			log:      "Attempt 1 failed with status 429. Retrying with backoff... GaxiosError: [{\"error\":{\"code\":429,\"message\":\"No capacity available for model gemini-3-pro-preview on the server\",\"reason\":\"rateLimitExceeded\"},\"status\":\"RESOURCE_EXHAUSTED\",\"reason\":\"MODEL_CAPACITY_EXHAUSTED\"}}]",
+			exitCode: 1,
+			retry:    true,
+		},
+		{
 			name:     "gemini non retryable for unrelated error",
 			agent:    "gemini",
 			log:      "authentication failed",
@@ -539,6 +732,67 @@ func TestDetectSessionLimitByAgent(t *testing.T) {
 
 			if got := detectSessionLimit(tt.log, tt.agent, tt.exitCode); got != tt.retry {
 				t.Fatalf("detectSessionLimit() = %v, want %v", got, tt.retry)
+			}
+		})
+	}
+}
+
+func TestDetectInternalServerError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		log  string
+		want bool
+	}{
+		{
+			name: "generic internal server error",
+			log:  "Something went wrong. Internal Server Error.",
+			want: true,
+		},
+		{
+			name: "500 internal",
+			log:  "HTTP 500 Internal Error",
+			want: true,
+		},
+		{
+			name: "502 bad gateway",
+			log:  "Error: 502 Bad Gateway",
+			want: true,
+		},
+		{
+			name: "503 service unavailable",
+			log:  "Service is overloaded, 503 Service Unavailable",
+			want: true,
+		},
+		{
+			name: "504 gateway timeout",
+			log:  "Request timed out: 504 Gateway Timeout",
+			want: true,
+		},
+		{
+			name: "overloaded",
+			log:  "Model is overloaded",
+			want: true,
+		},
+		{
+			name: "no error",
+			log:  "Everything is fine",
+			want: false,
+		},
+		{
+			name: "different error",
+			log:  "Syntax error in code",
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := detectInternalServerError(tt.log); got != tt.want {
+				t.Fatalf("detectInternalServerError(%q) = %v, want %v", tt.log, got, tt.want)
 			}
 		})
 	}
@@ -726,6 +980,20 @@ func TestWaitDurationGemini(t *testing.T) {
 			wantWaitSec: defaultFallbackWaitSec,
 			wantReset:   now.Add(defaultFallbackWaitSec * time.Second),
 		},
+		{
+			name:        "no capacity 429 uses 15 min wait",
+			log:         "No capacity available for model gemini-3-pro-preview on the server. RetryableQuotaError",
+			bufferSec:   120,
+			wantWaitSec: geminiCapacity429WaitSec + 120,
+			wantReset:   now.Add(time.Duration(geminiCapacity429WaitSec+120) * time.Second),
+		},
+		{
+			name:        "code 429 uses 15 min wait",
+			log:         "Error: cause: { code: 429, message: 'No capacity available' }",
+			bufferSec:   0,
+			wantWaitSec: geminiCapacity429WaitSec,
+			wantReset:   now.Add(time.Duration(geminiCapacity429WaitSec) * time.Second),
+		},
 	}
 
 	for _, tt := range tests {
@@ -748,18 +1016,32 @@ func TestNewStreamRenderer(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name             string
-		agent            string
-		streamView       string
-		wantCodexPretty  bool
-		wantRaw          bool
-		wantNoticeSubstr string
+		name                  string
+		agent                 string
+		streamView            string
+		wantCodexPretty       bool
+		wantCursorAgentPretty bool
+		wantGeminiPretty      bool
+		wantRaw               bool
+		wantNoticeSubstr      string
 	}{
 		{
 			name:            "codex pretty renderer for codex pretty view",
 			agent:           "codex",
 			streamView:      streamViewPretty,
 			wantCodexPretty: true,
+		},
+		{
+			name:                  "cursor-agent pretty renderer for cursor-agent pretty view",
+			agent:                 "cursor-agent",
+			streamView:            streamViewPretty,
+			wantCursorAgentPretty: true,
+		},
+		{
+			name:             "gemini pretty renderer for gemini pretty view",
+			agent:            "gemini",
+			streamView:       streamViewPretty,
+			wantGeminiPretty: true,
 		},
 		{
 			name:       "raw renderer for raw view",
@@ -769,7 +1051,7 @@ func TestNewStreamRenderer(t *testing.T) {
 		},
 		{
 			name:             "non-codex pretty falls back to raw with notice",
-			agent:            "gemini",
+			agent:            "claude",
 			streamView:       streamViewPretty,
 			wantRaw:          true,
 			wantNoticeSubstr: "not implemented",
@@ -792,6 +1074,16 @@ func TestNewStreamRenderer(t *testing.T) {
 			if tt.wantCodexPretty {
 				if _, ok := gotRenderer.(*codexPrettyRenderer); !ok {
 					t.Fatalf("renderer type mismatch: got %T want *codexPrettyRenderer", gotRenderer)
+				}
+			}
+			if tt.wantCursorAgentPretty {
+				if _, ok := gotRenderer.(*cursorAgentPrettyRenderer); !ok {
+					t.Fatalf("renderer type mismatch: got %T want *cursorAgentPrettyRenderer", gotRenderer)
+				}
+			}
+			if tt.wantGeminiPretty {
+				if _, ok := gotRenderer.(*geminiPrettyRenderer); !ok {
+					t.Fatalf("renderer type mismatch: got %T want *geminiPrettyRenderer", gotRenderer)
 				}
 			}
 			if tt.wantRaw {
@@ -870,6 +1162,112 @@ func TestCodexPrettyRenderer(t *testing.T) {
 	})
 }
 
+func TestCursorAgentPrettyRenderer(t *testing.T) {
+	t.Parallel()
+
+	renderer := &cursorAgentPrettyRenderer{}
+
+	t.Run("shows success result with duration and content", func(t *testing.T) {
+		t.Parallel()
+		line := `{"type":"result","subtype":"success","is_error":false,"duration_ms":56885,"result":"Checking layout structure.\n\n## Summary\nFix applied."}`
+		got := renderer.ConsumeLine(line)
+		if len(got) < 3 {
+			t.Fatalf("expected multiline output, got %v", got)
+		}
+		if !strings.Contains(got[0], "[done]") {
+			t.Fatalf("missing [done] header: %q", got[0])
+		}
+		if !strings.Contains(got[0], "56.9") {
+			t.Fatalf("missing duration: %q", got[0])
+		}
+		if !strings.Contains(got[1], "Checking layout structure") {
+			t.Fatalf("missing result content: %q", got[1])
+		}
+		content := strings.Join(got, "\n")
+		if !strings.Contains(content, "## Summary") {
+			t.Fatalf("missing markdown content: %q", content)
+		}
+	})
+
+	t.Run("shows error result", func(t *testing.T) {
+		t.Parallel()
+		got := renderer.ConsumeLine(`{"type":"result","subtype":"error","is_error":true,"result":"Something went wrong"}`)
+		if len(got) < 2 {
+			t.Fatalf("expected output, got %v", got)
+		}
+		if got[0] != "[error] error" {
+			t.Fatalf("unexpected error header: %q", got[0])
+		}
+		if !strings.Contains(got[1], "Something went wrong") {
+			t.Fatalf("missing error content: %q", got[1])
+		}
+	})
+
+	t.Run("suppresses non-result events", func(t *testing.T) {
+		t.Parallel()
+		got := renderer.ConsumeLine(`{"type":"item.started","item":{"type":"command_execution"}}`)
+		if len(got) != 0 {
+			t.Fatalf("expected no output for non-result, got %v", got)
+		}
+	})
+
+	t.Run("passes non-json lines through", func(t *testing.T) {
+		t.Parallel()
+		got := renderer.ConsumeLine("plain text output")
+		if len(got) != 1 || got[0] != "plain text output" {
+			t.Fatalf("unexpected output: %v", got)
+		}
+	})
+}
+
+func TestGeminiPrettyRenderer(t *testing.T) {
+	t.Parallel()
+
+	t.Run("suppresses YOLO and credentials", func(t *testing.T) {
+		t.Parallel()
+		r := &geminiPrettyRenderer{}
+		if got := r.ConsumeLine("YOLO mode is enabled. All tool calls will be automatically approved."); got != nil {
+			t.Fatalf("expected suppress, got %v", got)
+		}
+		if got := r.ConsumeLine("Loaded cached credentials."); got != nil {
+			t.Fatalf("expected suppress, got %v", got)
+		}
+	})
+
+	t.Run("passes through tool errors", func(t *testing.T) {
+		t.Parallel()
+		r := &geminiPrettyRenderer{}
+		line := "Error executing tool replace: Error: Failed to edit, expected 4 occurrences but found 1."
+		got := r.ConsumeLine(line)
+		if len(got) != 1 || got[0] != line {
+			t.Fatalf("expected tool error line, got %v", got)
+		}
+	})
+
+	t.Run("formats single-line result JSON", func(t *testing.T) {
+		t.Parallel()
+		r := &geminiPrettyRenderer{}
+		line := `{"session_id":"abc","response":"Done.","stats":{"models":{"m1":{"api":{"totalRequests":2,"totalErrors":0,"totalLatencyMs":5000},"tokens":{"input":100,"prompt":200,"candidates":50,"total":350,"cached":0,"thoughts":0,"tool":0}}},"tools":{"totalCalls":5,"totalSuccess":5,"totalFail":0,"totalDurationMs":1200},"files":{"totalLinesAdded":10,"totalLinesRemoved":2}}}`
+		got := r.ConsumeLine(line)
+		if len(got) < 3 {
+			t.Fatalf("expected formatted lines, got %v", got)
+		}
+		joined := strings.Join(got, "\n")
+		if !strings.Contains(joined, "[assistant]") {
+			t.Fatalf("missing [assistant] in %s", joined)
+		}
+		if !strings.Contains(joined, "tokens:") {
+			t.Fatalf("missing tokens stats in %s", joined)
+		}
+		if !strings.Contains(joined, "tools:") {
+			t.Fatalf("missing tools stats in %s", joined)
+		}
+		if !strings.Contains(joined, "files:") {
+			t.Fatalf("missing files stats in %s", joined)
+		}
+	})
+}
+
 func TestMainInvalidFlagsExitNonZero(t *testing.T) {
 	t.Parallel()
 
@@ -918,6 +1316,399 @@ func TestMainInvalidFlagsExitNonZero(t *testing.T) {
 	}
 }
 
+func TestParseArgsFileFlags(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		args         []string
+		wantFiles    string
+		wantAllFiles string
+		wantErr      string
+	}{
+		{
+			name:      "files flag",
+			args:      []string{"--files", "a.md,b.md"},
+			wantFiles: "a.md,b.md",
+		},
+		{
+			name:         "all-files flag",
+			args:         []string{"--all-files", "tasks"},
+			wantAllFiles: "tasks",
+		},
+		{
+			name:    "missing files value",
+			args:    []string{"--files"},
+			wantErr: "--files requires a value",
+		},
+		{
+			name:    "missing all-files value",
+			args:    []string{"--all-files"},
+			wantErr: "--all-files requires a value",
+		},
+		{
+			name:    "files with issue is invalid",
+			args:    []string{"--files", "a.md", "--issue", "1"},
+			wantErr: "--files/--all-files cannot be combined with --issue/--all-open/--issues/--issues-file",
+		},
+		{
+			name:    "all-files with all-open is invalid",
+			args:    []string{"--all-files", "tasks", "--all-open"},
+			wantErr: "--files/--all-files cannot be combined with --issue/--all-open/--issues/--issues-file",
+		},
+		{
+			name:    "files with issues csv is invalid",
+			args:    []string{"--files", "a.md", "--issues", "1,2"},
+			wantErr: "--files/--all-files cannot be combined with --issue/--all-open/--issues/--issues-file",
+		},
+		{
+			name:    "all-files with issues-file is invalid",
+			args:    []string{"--all-files", "tasks", "--issues-file", "issues.txt"},
+			wantErr: "--files/--all-files cannot be combined with --issue/--all-open/--issues/--issues-file",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			opts, err := parseArgs(tt.args)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("unexpected error: got %q want substring %q", err.Error(), tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseArgs returned unexpected error: %v", err)
+			}
+			if opts.Files != tt.wantFiles {
+				t.Fatalf("files mismatch: got %q want %q", opts.Files, tt.wantFiles)
+			}
+			if opts.AllFiles != tt.wantAllFiles {
+				t.Fatalf("all-files mismatch: got %q want %q", opts.AllFiles, tt.wantAllFiles)
+			}
+		})
+	}
+}
+
+func TestLoadIssuesFromFiles(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	// Create test files
+	for _, name := range []string{"task1.md", "task2.md"} {
+		if err := os.WriteFile(fmt.Sprintf("%s/%s", dir, name), []byte("# "+name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	r := &runner{
+		opts:     options{Files: "task1.md,task2.md"},
+		repoRoot: dir,
+	}
+
+	got, err := r.loadIssues()
+	if err != nil {
+		t.Fatalf("loadIssues returned unexpected error: %v", err)
+	}
+
+	want := []string{"task1.md", "task2.md"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("issues mismatch: got %v want %v", got, want)
+	}
+}
+
+func TestLoadIssuesFromFilesDedup(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(fmt.Sprintf("%s/a.md", dir), []byte("# a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &runner{
+		opts:     options{Files: "a.md,a.md"},
+		repoRoot: dir,
+	}
+
+	got, err := r.loadIssues()
+	if err != nil {
+		t.Fatalf("loadIssues returned unexpected error: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("expected 1 file, got %d: %v", len(got), got)
+	}
+}
+
+func TestLoadIssuesFromFilesMissing(t *testing.T) {
+	t.Parallel()
+
+	r := &runner{
+		opts:     options{Files: "nonexistent.md"},
+		repoRoot: t.TempDir(),
+	}
+
+	_, err := r.loadIssues()
+	if err == nil {
+		t.Fatal("expected error for missing file")
+	}
+	if !strings.Contains(err.Error(), "file not found") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadIssuesFromAllFiles(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	tasksDir := fmt.Sprintf("%s/tasks", dir)
+	if err := os.Mkdir(tasksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create files with numeric names to test sort order
+	for _, name := range []string{"10.md", "2.md", "1.md", "readme.txt"} {
+		if err := os.WriteFile(fmt.Sprintf("%s/%s", tasksDir, name), []byte("content"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	r := &runner{
+		opts:     options{AllFiles: "tasks"},
+		repoRoot: dir,
+	}
+
+	got, err := r.loadIssues()
+	if err != nil {
+		t.Fatalf("loadIssues returned unexpected error: %v", err)
+	}
+
+	// Should filter out readme.txt and sort numerically
+	want := []string{"tasks/1.md", "tasks/2.md", "tasks/10.md"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("issues mismatch: got %v want %v", got, want)
+	}
+}
+
+func TestLoadIssuesFromAllFilesEmpty(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	emptyDir := fmt.Sprintf("%s/empty", dir)
+	if err := os.Mkdir(emptyDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &runner{
+		opts:     options{AllFiles: "empty"},
+		repoRoot: dir,
+	}
+
+	_, err := r.loadIssues()
+	if err == nil {
+		t.Fatal("expected error for empty directory")
+	}
+	if !strings.Contains(err.Error(), "no .md files found") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestFetchFileDetails(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		content   string
+		wantTitle string
+		wantBody  string
+	}{
+		{
+			name:      "with H1 title",
+			content:   "# Add authentication\n\nImplement JWT auth for the API.\n\n## Details\n\nUse RS256.",
+			wantTitle: "Add authentication",
+			wantBody:  "Implement JWT auth for the API.\n\n## Details\n\nUse RS256.",
+		},
+		{
+			name:      "without H1 title uses filename",
+			content:   "Just some content\nwith no heading.",
+			wantTitle: "task",
+			wantBody:  "Just some content\nwith no heading.",
+		},
+		{
+			name:      "H1 not on first line",
+			content:   "Some preamble\n# The Real Title\n\nBody here.",
+			wantTitle: "The Real Title",
+			wantBody:  "Body here.",
+		},
+		{
+			name:      "empty body after title",
+			content:   "# Title Only",
+			wantTitle: "Title Only",
+			wantBody:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			filePath := fmt.Sprintf("%s/task.md", dir)
+			if err := os.WriteFile(filePath, []byte(tt.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			r := &runner{repoRoot: dir, fileMode: true}
+			details, err := r.fetchIssueDetails("task.md")
+			if err != nil {
+				t.Fatalf("fetchIssueDetails returned unexpected error: %v", err)
+			}
+			if details.Title != tt.wantTitle {
+				t.Fatalf("title mismatch: got %q want %q", details.Title, tt.wantTitle)
+			}
+			if details.Body != tt.wantBody {
+				t.Fatalf("body mismatch: got %q want %q", details.Body, tt.wantBody)
+			}
+		})
+	}
+}
+
+func TestBuildPromptFileMode(t *testing.T) {
+	t.Parallel()
+
+	r := &runner{fileMode: true}
+	details := issueDetails{Title: "Add auth", Body: "Implement JWT."}
+	prompt, err := r.buildPrompt("tasks/auth.md", details, false)
+	if err != nil {
+		t.Fatalf("buildPrompt returned unexpected error: %v", err)
+	}
+
+	if !strings.Contains(prompt, "tasks/auth.md") {
+		t.Fatalf("prompt should contain file path, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "Add auth") {
+		t.Fatalf("prompt should contain title, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "Implement JWT.") {
+		t.Fatalf("prompt should contain body, got:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "GitHub issue") {
+		t.Fatalf("file mode prompt should not mention GitHub issue, got:\n%s", prompt)
+	}
+}
+
+func TestBuildPromptIssueModeUnchanged(t *testing.T) {
+	t.Parallel()
+
+	r := &runner{fileMode: false}
+	details := issueDetails{Title: "Fix bug", Body: "Something is broken."}
+	prompt, err := r.buildPrompt("42", details, false)
+	if err != nil {
+		t.Fatalf("buildPrompt returned unexpected error: %v", err)
+	}
+
+	if !strings.Contains(prompt, "#42") {
+		t.Fatalf("issue mode prompt should contain #42, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "GitHub issue") {
+		t.Fatalf("issue mode prompt should mention GitHub issue, got:\n%s", prompt)
+	}
+}
+
+func TestLogFileName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		fileMode bool
+		issue    string
+		want     string
+	}{
+		{
+			name:     "issue mode",
+			fileMode: false,
+			issue:    "42",
+			want:     "42.log",
+		},
+		{
+			name:     "file mode simple",
+			fileMode: true,
+			issue:    "task.md",
+			want:     "task.md.log",
+		},
+		{
+			name:     "file mode with directory",
+			fileMode: true,
+			issue:    "tasks/add-auth.md",
+			want:     "tasks__add-auth.md.log",
+		},
+		{
+			name:     "file mode nested directory",
+			fileMode: true,
+			issue:    "a/b/c.md",
+			want:     "a__b__c.md.log",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := &runner{fileMode: tt.fileMode}
+			got := r.logFileName(tt.issue)
+			if got != tt.want {
+				t.Fatalf("logFileName mismatch: got %q want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIssueLabel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		fileMode bool
+		issue    string
+		want     string
+	}{
+		{
+			name:     "issue mode",
+			fileMode: false,
+			issue:    "42",
+			want:     "#42",
+		},
+		{
+			name:     "file mode",
+			fileMode: true,
+			issue:    "tasks/add-auth.md",
+			want:     "tasks/add-auth.md",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := &runner{fileMode: tt.fileMode}
+			got := r.issueLabel(tt.issue)
+			if got != tt.want {
+				t.Fatalf("issueLabel mismatch: got %q want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestMainHelperProcess(t *testing.T) {
 	if os.Getenv("GHIR_TEST_HELPER_PROCESS") != "1" {
 		return
@@ -937,4 +1728,97 @@ func TestMainHelperProcess(t *testing.T) {
 	os.Args = append([]string{os.Args[0]}, os.Args[idx+1:]...)
 	main()
 	os.Exit(0)
+}
+
+func TestParseArgsLoop(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{
+			name: "flag present",
+			args: []string{"--loop", "--all-open"},
+			want: true,
+		},
+		{
+			name: "flag absent",
+			args: []string{},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			opts, err := parseArgs(tt.args)
+			if err != nil {
+				t.Fatalf("parseArgs returned unexpected error: %v", err)
+			}
+			if opts.Loop != tt.want {
+				t.Fatalf("Loop mismatch: got %v want %v", opts.Loop, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseArgsLoopValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "loop with all-open",
+			args:    []string{"--loop", "--all-open"},
+			wantErr: "",
+		},
+		{
+			name:    "loop with all-files",
+			args:    []string{"--loop", "--all-files", "dir"},
+			wantErr: "",
+		},
+		{
+			name:    "loop without all-open or all-files",
+			args:    []string{"--loop"},
+			wantErr: "--loop requires either --all-open or --all-files",
+		},
+		{
+			name:    "loop with files (invalid)",
+			args:    []string{"--loop", "--files", "a.md"},
+			wantErr: "--loop requires either --all-open or --all-files",
+		},
+		{
+			name:    "loop with issue (invalid)",
+			args:    []string{"--loop", "--issue", "1"},
+			wantErr: "--loop requires either --all-open or --all-files",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := parseArgs(tt.args)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("unexpected error: got %q want substring %q", err.Error(), tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseArgs returned unexpected error: %v", err)
+			}
+		})
+	}
 }

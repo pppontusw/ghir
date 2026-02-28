@@ -106,22 +106,18 @@ ghir --reset 1710
 Use `--model` to override model per run:
 
 ```bash
-ghir --agent claude --model sonnet --issues 1721,1706
-ghir --agent codex --model gpt-5.3-codex --issues 1721,1706
-ghir --agent gemini --model gemini-3-pro-preview --issues 1721,1706
-ghir --agent cursor-agent --model auto --issues 1721,1706
+ghir --agent claude --model claude-3-5-sonnet-20241022 --issues 1721,1706
+ghir --agent codex --model gpt-4o --issues 1721,1706
+ghir --agent gemini --model gemini-1.5-pro --issues 1721,1706
+ghir --agent cursor-agent --model claude-3.5-sonnet --issues 1721,1706
 ```
 
-Flag mapping:
-- Claude: `--model`
-- Codex: `--model`
-- Gemini: `-m`
-- Cursor Agent: `--model`
+*Note: Maps to `--model` natively for Claude, Codex, and Cursor Agent, and `-m` for Gemini.*
 
 Streaming view:
-- `--stream-view pretty` (default): condensed event rendering for Codex JSON output.
+- `--stream-view pretty` (default): condensed event rendering for Codex, cursor-agent, and Gemini JSON output.
 - `--stream-view raw`: passthrough raw agent output to console.
-- For non-Codex agents, `pretty` currently falls back to raw passthrough with a notice.
+- For other agents, `pretty` falls back to raw passthrough with a notice.
 
 ## State and Logs
 

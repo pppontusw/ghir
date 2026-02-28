@@ -29,39 +29,54 @@ const (
 )
 
 var (
-	claudeSessionLimitPattern = regexp.MustCompile(`(?is)(out of\s+(extra\s+)?usage|hit your\s+(usage\s+)?limit|exceeded.*(usage|limit)|usage\s+limit|rate\s+limit).*resets?`)
-	claudeResetTimePattern    = regexp.MustCompile(`(?i)resets?\s+(?:at\s+)?[A-Za-z]*\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*\(?(UTC)?\)?`)
-	codexResetTsPattern       = regexp.MustCompile(`(?i)resets_at\\?"?[:\s]+(\d+)`)
-	codexResetInSecPattern    = regexp.MustCompile(`(?i)resets_in_seconds\\?"?[:\s]+(\d+)`)
-	geminiSessionLimitPattern = regexp.MustCompile(`(?is)(terminalquotaerror|quota\s+exceeded|rate\s+limit)`)
-	geminiResetDurationRegex  = regexp.MustCompile(`(?i)resets?\s+(?:after\s+)?(\d+h)?(\d+m)?(\d+s)?`)
-	geminiDurationPartRegex   = regexp.MustCompile(`(?i)(\d+)([hms])`)
-	issuePattern              = regexp.MustCompile(`^\d+$`)
+	claudeSessionLimitPattern  = regexp.MustCompile(`(?is)(out of\s+(extra\s+)?usage|hit your\s+(usage\s+)?limit|exceeded.*(usage|limit)|usage\s+limit|rate\s+limit).*resets?`)
+	claudeResetTimePattern     = regexp.MustCompile(`(?i)resets?\s+(?:at\s+)?[A-Za-z]*\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*\(?(UTC)?\)?`)
+	codexResetTsPattern        = regexp.MustCompile(`(?i)resets_at\\?"?[:\s]+(\d+)`)
+	codexResetInSecPattern     = regexp.MustCompile(`(?i)resets_in_seconds\\?"?[:\s]+(\d+)`)
+	geminiSessionLimitPattern  = regexp.MustCompile(`(?is)(terminalquotaerror|quota\s+exceeded|rate\s+limit|no\s+capacity\s+available|retryablequotaerror)`)
+	geminiCapacity429WaitSec   = 900 // 15 minutes for "no capacity" / 429 from Gemini
+	geminiResetDurationRegex   = regexp.MustCompile(`(?i)resets?\s+(?:after\s+)?(\d+h)?(\d+m)?(\d+s)?`)
+	geminiDurationPartRegex    = regexp.MustCompile(`(?i)(\d+)([hms])`)
+	internalServerErrorPattern = regexp.MustCompile(`(?i)(internal\s+server\s+error|500\s+internal|502\s+bad\s+gateway|503\s+service\s+unavailable|504\s+gateway\s+timeout|overloaded)`)
+	issuePattern               = regexp.MustCompile(`^\d+$`)
+)
+
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
 )
 
 type options struct {
-	DryRun         bool
-	SingleIssue    string
-	Force          bool
-	Status         bool
-	Reset          bool
-	ResetIssue     string
-	IssuesCSV      string
-	IssuesFile     string
-	LogDir         string
-	DoneFile       string
-	PromptTemplate string
-	Agent          string
-	Model          string
-	ClaudeBin      string
-	CodexBin       string
-	GeminiBin      string
-	CursorBin      string
-	GHBin          string
-	StreamView     string
-	NoColor        bool
-	Help           bool
-	WaitBufferSec  int
+	DryRun          bool
+	SingleIssue     string
+	AllOpen         bool
+	Label           string
+	Force           bool
+	Status          bool
+	Reset           bool
+	ResetIssue      string
+	IssuesCSV       string
+	IssuesFile      string
+	Files           string
+	AllFiles        string
+	LogDir          string
+	DoneFile        string
+	PromptTemplate  string
+	Agent           string
+	Model           string
+	ClaudeBin       string
+	CodexBin        string
+	GeminiBin       string
+	CursorBin       string
+	GHBin           string
+	StreamView      string
+	NoColor         bool
+	Help            bool
+	Version         bool
+	WaitBufferSec   int
+	ContinueOnError bool
+	Loop            bool
 }
 
 type palette struct {
@@ -75,6 +90,7 @@ type palette struct {
 type runner struct {
 	opts     options
 	repoRoot string
+	fileMode bool
 	doneFile string
 	doneSet  map[string]struct{}
 	colors   palette
@@ -104,6 +120,10 @@ func main() {
 		printUsage()
 		return
 	}
+	if opts.Version {
+		fmt.Printf("ticket-runner version %s (commit: %s, built at: %s)\n", version, commit, date)
+		return
+	}
 
 	repoRoot, err := findRepoRoot()
 	if err != nil {
@@ -119,6 +139,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := r.preflightChecks(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
 	if opts.Reset {
 		if err := r.handleReset(); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -127,52 +152,33 @@ func main() {
 		return
 	}
 
-	issues, err := r.loadIssues()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
-	}
-
-	if opts.Status {
-		r.printStatus(issues)
-		return
-	}
-
-	r.printBanner(issues)
-
-	if opts.SingleIssue != "" {
-		r.opts.Force = true
-		result := r.processIssue(1, len(issues), issues[0])
-		if result != resultSuccess {
-			os.Exit(1)
+	loop := func() bool {
+		failed, err := runOnce(r)
+		if err != nil {
+			if r.opts.Loop && (strings.Contains(err.Error(), "no open issues found") || strings.Contains(err.Error(), "no .md files found")) {
+				r.printf(r.colors.Yellow, "No issues found.\n")
+				return true
+			}
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			return false
 		}
-		return
+		if !r.opts.Loop && failed > 0 {
+			return false
+		}
+		return true
 	}
 
-	succeeded, failed := 0, 0
-	for i, issue := range issues {
-		idx := i + 1
-		result := r.processIssue(idx, len(issues), issue)
-		for result == resultRetry {
-			r.printf(r.colors.Blue, "Retrying issue #%s after session limit reset...\n", issue)
-			result = r.processIssue(idx, len(issues), issue)
+	if opts.Loop {
+		for {
+			if !loop() {
+				os.Exit(1)
+			}
+			r.printf(r.colors.Yellow, "Waiting 5 minutes before checking for new issues...\n")
+			time.Sleep(5 * time.Minute)
 		}
-		if result == resultSuccess {
-			succeeded++
-			continue
-		}
-		failed++
-		r.printf(r.colors.Red, "Stopping due to failure on issue #%s\n", issue)
-		break
 	}
 
-	fmt.Println()
-	r.printf(r.colors.Blue, "============================================================\n")
-	r.printf(r.colors.Green, "Succeeded: %d\n", succeeded)
-	r.printf(r.colors.Red, "Failed: %d\n", failed)
-	r.printf(r.colors.Blue, "============================================================\n")
-
-	if failed > 0 {
+	if !loop() {
 		os.Exit(1)
 	}
 }
@@ -201,6 +207,15 @@ func parseArgs(args []string) (options, error) {
 			}
 			opts.SingleIssue = val
 			i = next
+		case "--all-open":
+			opts.AllOpen = true
+		case "--label":
+			val, next, err := requireValue(arg, args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Label = val
+			i = next
 		case "--force":
 			opts.Force = true
 		case "--status":
@@ -224,6 +239,20 @@ func parseArgs(args []string) (options, error) {
 				return opts, err
 			}
 			opts.IssuesFile = val
+			i = next
+		case "--files":
+			val, next, err := requireValue(arg, args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Files = val
+			i = next
+		case "--all-files":
+			val, next, err := requireValue(arg, args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.AllFiles = val
 			i = next
 		case "--log-dir":
 			val, next, err := requireValue(arg, args, i)
@@ -315,6 +344,12 @@ func parseArgs(args []string) (options, error) {
 			i = next
 		case "--no-color":
 			opts.NoColor = true
+		case "--continue-on-error":
+			opts.ContinueOnError = true
+		case "--loop":
+			opts.Loop = true
+		case "--version":
+			opts.Version = true
 		case "-h", "--help":
 			opts.Help = true
 		default:
@@ -322,11 +357,16 @@ func parseArgs(args []string) (options, error) {
 		}
 	}
 
+	hasFileFlags := opts.Files != "" || opts.AllFiles != ""
+	hasIssueFlags := opts.SingleIssue != "" || opts.AllOpen || opts.IssuesCSV != "" || opts.IssuesFile != ""
+	if hasFileFlags && hasIssueFlags {
+		return opts, fmt.Errorf("--files/--all-files cannot be combined with --issue/--all-open/--issues/--issues-file")
+	}
+	if opts.Loop && !opts.AllOpen && opts.AllFiles == "" {
+		return opts, fmt.Errorf("--loop requires either --all-open or --all-files")
+	}
 	if opts.SingleIssue != "" && !issuePattern.MatchString(opts.SingleIssue) {
 		return opts, fmt.Errorf("--issue must be numeric: %q", opts.SingleIssue)
-	}
-	if opts.ResetIssue != "" && !issuePattern.MatchString(opts.ResetIssue) {
-		return opts, fmt.Errorf("--reset issue must be numeric: %q", opts.ResetIssue)
 	}
 	if opts.Agent != "claude" && opts.Agent != "codex" && opts.Agent != "gemini" && opts.Agent != "cursor-agent" {
 		return opts, fmt.Errorf("--agent must be one of: claude, codex, gemini, cursor-agent")
@@ -357,11 +397,15 @@ Usage:
 Options:
   --dry-run                     Show what would run without invoking the agent CLI
   --issue <id>                  Process exactly one issue (forced re-run)
+  --all-open                    Process all open issues in the repository
+  --label <label>               Filter issues by label when using --all-open
   --force                       Re-run even if issue is marked completed
   --status                      Show completion status for configured issues
   --reset [id]                  Reset all completions, or one issue if id is provided
   --issues <id1,id2,...>        Comma-separated issue list (overrides file)
   --issues-file <path>          Issue list file (default: .ticket-runner/issues.txt)
+  --files <path1,path2,...>      Comma-separated markdown file paths
+  --all-files <dir>              Process all *.md files in directory
   --prompt-template <path>      Optional template with {{ISSUE_NUMBER}}, {{ISSUE_TITLE}}, {{ISSUE_BODY}}
   --agent <claude|codex|gemini|cursor-agent> Agent CLI to run (default: claude)
   --model <model-id>            Override model for selected agent
@@ -375,6 +419,8 @@ Options:
   --stream-view <pretty|raw>    Console streaming view (default: pretty)
   --wait-buffer-sec <seconds>   Extra wait seconds after reset time (default: 120)
   --no-color                    Disable ANSI colors
+  --continue-on-error           Continue processing remaining issues after a failure
+  --version                     Show version information
   -h, --help                    Show this help
 `)
 }
@@ -452,10 +498,58 @@ func newRunner(opts options, repoRoot string) (*runner, error) {
 	return &runner{
 		opts:     opts,
 		repoRoot: repoRoot,
+		fileMode: opts.Files != "" || opts.AllFiles != "",
 		doneFile: opts.DoneFile,
 		doneSet:  done,
 		colors:   colors,
 	}, nil
+}
+
+func (r *runner) preflightChecks() error {
+	if err := r.checkBinary("git", "git"); err != nil {
+		return err
+	}
+
+	// In file mode, we don't strictly need gh for some operations, but it's safer to enforce consistency.
+	// However, if we are in file mode, we might not use gh at all if we just read files.
+	// But the issue requirement says "Verify git, gh, and selected agent binary are available in PATH".
+	// Let's check gh if not in file mode OR if we want to be strict.
+	// The current implementation uses gh to fetch issues if not in file mode.
+	// Also fetchIssueDetails uses gh if not in file mode.
+	if !r.fileMode {
+		if err := r.checkBinary("gh", r.opts.GHBin); err != nil {
+			return err
+		}
+	}
+
+	var agentBin string
+	switch r.opts.Agent {
+	case "claude":
+		agentBin = r.opts.ClaudeBin
+	case "codex":
+		agentBin = r.opts.CodexBin
+	case "gemini":
+		agentBin = r.opts.GeminiBin
+	case "cursor-agent":
+		agentBin = r.opts.CursorBin
+	}
+
+	if err := r.checkBinary(r.opts.Agent, agentBin); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *runner) checkBinary(name, binPath string) error {
+	path, err := exec.LookPath(binPath)
+	if err != nil {
+		return fmt.Errorf("missing required binary '%s': %s not found in PATH", name, binPath)
+	}
+	if r.opts.DryRun {
+		r.printf(r.colors.Green, "[DRY RUN] Found %s at %s\n", name, path)
+	}
+	return nil
 }
 
 func ensureFile(path string) error {
@@ -483,13 +577,113 @@ func loadDoneSet(path string) (map[string]struct{}, error) {
 }
 
 func (r *runner) loadIssues() ([]string, error) {
+	if r.opts.Files != "" {
+		return r.loadFilePaths(r.opts.Files)
+	}
+	if r.opts.AllFiles != "" {
+		return r.loadAllFiles(r.opts.AllFiles)
+	}
 	if r.opts.SingleIssue != "" {
 		return []string{r.opts.SingleIssue}, nil
+	}
+	if r.opts.AllOpen {
+		return r.fetchOpenIssues()
 	}
 	if r.opts.IssuesCSV != "" {
 		return parseCSVIssues(r.opts.IssuesCSV)
 	}
 	return readIssuesFile(r.opts.IssuesFile)
+}
+
+func (r *runner) loadFilePaths(csv string) ([]string, error) {
+	parts := strings.Split(csv, ",")
+	var paths []string
+	seen := make(map[string]struct{})
+	for _, part := range parts {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
+		}
+		abs := resolvePath(r.repoRoot, p)
+		if _, err := os.Stat(abs); err != nil {
+			return nil, fmt.Errorf("file not found: %s", p)
+		}
+		rel, relErr := filepath.Rel(r.repoRoot, abs)
+		if relErr != nil {
+			rel = p
+		}
+		if _, exists := seen[rel]; exists {
+			continue
+		}
+		paths = append(paths, rel)
+		seen[rel] = struct{}{}
+	}
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("no files found in --files")
+	}
+	return paths, nil
+}
+
+func (r *runner) loadAllFiles(dir string) ([]string, error) {
+	abs := resolvePath(r.repoRoot, dir)
+	entries, err := os.ReadDir(abs)
+	if err != nil {
+		return nil, fmt.Errorf("read directory: %w", err)
+	}
+	var paths []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if !strings.HasSuffix(strings.ToLower(entry.Name()), ".md") {
+			continue
+		}
+		fullPath := filepath.Join(abs, entry.Name())
+		rel, relErr := filepath.Rel(r.repoRoot, fullPath)
+		if relErr != nil {
+			rel = fullPath
+		}
+		paths = append(paths, rel)
+	}
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("no .md files found in %s", dir)
+	}
+	sortStringsNumeric(paths)
+	return paths, nil
+}
+
+func (r *runner) fetchOpenIssues() ([]string, error) {
+	// Fetch enough issues to cover most backlogs.
+	// We only need the number.
+	args := []string{"issue", "list", "--state", "open", "--limit", "4000", "--json", "number"}
+	if r.opts.Label != "" {
+		args = append(args, "--label", r.opts.Label)
+	}
+	out, err := r.commandOutput(r.opts.GHBin, args...)
+	if err != nil {
+		return nil, fmt.Errorf("fetch open issues: %w", err)
+	}
+
+	var items []struct {
+		Number int `json:"number"`
+	}
+	if err := json.Unmarshal([]byte(out), &items); err != nil {
+		return nil, fmt.Errorf("parse gh output: %w", err)
+	}
+
+	var issues []string
+	for _, item := range items {
+		issues = append(issues, strconv.Itoa(item.Number))
+	}
+
+	if len(issues) == 0 {
+		return nil, fmt.Errorf("no open issues found")
+	}
+
+	// Sort numerically ascending (Oldest First)
+	sortStringsNumeric(issues)
+
+	return issues, nil
 }
 
 func parseCSVIssues(value string) ([]string, error) {
@@ -520,7 +714,7 @@ func readIssuesFile(path string) ([]string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("issue file not found: %s (or pass --issues)", path)
+			return nil, fmt.Errorf("issue file not found: %s\nHint: create the file, pass --issues <list>, or use --all-open", path)
 		}
 		return nil, fmt.Errorf("read issues file: %w", err)
 	}
@@ -554,7 +748,7 @@ func readIssuesFile(path string) ([]string, error) {
 func (r *runner) handleReset() error {
 	if r.opts.ResetIssue != "" {
 		delete(r.doneSet, r.opts.ResetIssue)
-		return r.rewriteDoneFile(fmt.Sprintf("Reset completion for issue #%s\n", r.opts.ResetIssue))
+		return r.rewriteDoneFile(fmt.Sprintf("Reset completion for %s\n", r.issueLabel(r.opts.ResetIssue)))
 	}
 	r.doneSet = make(map[string]struct{})
 	if err := os.WriteFile(r.doneFile, []byte{}, 0o644); err != nil {
@@ -588,6 +782,13 @@ func sortStringsNumeric(values []string) {
 		if aerr == nil && berr == nil {
 			return ai < bi
 		}
+		aBase := strings.TrimSuffix(filepath.Base(a), filepath.Ext(a))
+		bBase := strings.TrimSuffix(filepath.Base(b), filepath.Ext(b))
+		if an, err := strconv.Atoi(aBase); err == nil {
+			if bn, err := strconv.Atoi(bBase); err == nil {
+				return an < bn
+			}
+		}
 		return a < b
 	}
 	for i := 0; i < len(values); i++ {
@@ -603,9 +804,9 @@ func (r *runner) printStatus(issues []string) {
 	r.printf(r.colors.Blue, "Completion status:\n")
 	for _, issue := range issues {
 		if r.isCompleted(issue) {
-			r.printf(r.colors.Green, "  #%s done\n", issue)
+			r.printf(r.colors.Green, "  %s done\n", r.issueLabel(issue))
 		} else {
-			r.printf(r.colors.Yellow, "  #%s pending\n", issue)
+			r.printf(r.colors.Yellow, "  %s pending\n", r.issueLabel(issue))
 		}
 	}
 }
@@ -631,30 +832,32 @@ func (r *runner) printBanner(issues []string) {
 	fmt.Println()
 }
 
-func (r *runner) processIssue(idx, total int, issue string) issueResult {
+func (r *runner) processIssue(idx, total int, issue string, isResume bool) issueResult {
 	details, err := r.fetchIssueDetails(issue)
 	if err != nil {
-		r.printf(r.colors.Red, "FAILED: unable to fetch issue #%s: %v\n", issue, err)
+		r.printf(r.colors.Red, "FAILED: unable to fetch %s: %v\n", r.issueLabel(issue), err)
 		return resultFailed
 	}
 
 	r.printf(r.colors.Blue, "------------------------------------------------------------\n")
-	r.printf(r.colors.Blue, "[%d/%d] Issue #%s: %s\n", idx, total, issue, details.Title)
+	r.printf(r.colors.Blue, "[%d/%d] %s: %s\n", idx, total, r.issueLabel(issue), details.Title)
 	r.printf(r.colors.Blue, "------------------------------------------------------------\n")
 
 	if r.opts.DryRun {
 		if r.isCompleted(issue) {
-			r.printf(r.colors.Green, "[DRY RUN] Already completed #%s, would skip\n", issue)
+			r.printf(r.colors.Green, "[DRY RUN] Already completed %s, would skip\n", r.issueLabel(issue))
 		} else {
-			r.printf(r.colors.Yellow, "[DRY RUN] Would process issue #%s\n", issue)
+			r.printf(r.colors.Yellow, "[DRY RUN] Would process %s\n", r.issueLabel(issue))
 		}
 		return resultSuccess
 	}
 
 	if r.isCompleted(issue) && !r.opts.Force {
-		r.printf(r.colors.Green, "Already completed #%s, skipping (use --force to reprocess)\n", issue)
+		r.printf(r.colors.Green, "Already completed %s, skipping (use --force to reprocess)\n", r.issueLabel(issue))
 		return resultSuccess
 	}
+
+	r.setIssueLabel(issue, "ghir:running")
 
 	dirty, err := r.workingTreeDirty()
 	if err != nil {
@@ -663,6 +866,7 @@ func (r *runner) processIssue(idx, total int, issue string) issueResult {
 	}
 	if dirty {
 		r.printf(r.colors.Red, "ERROR: uncommitted changes detected. Commit or stash before running.\n")
+		r.printf(r.colors.Yellow, "Hint: review with `git status` and commit or stash changes.\n")
 		return resultFailed
 	}
 
@@ -672,29 +876,57 @@ func (r *runner) processIssue(idx, total int, issue string) issueResult {
 		return resultFailed
 	}
 
-	prompt, err := r.buildPrompt(issue, details)
+	prompt, err := r.buildPrompt(issue, details, isResume)
 	if err != nil {
-		r.printf(r.colors.Red, "FAILED: cannot build prompt for #%s: %v\n", issue, err)
+		r.printf(r.colors.Red, "FAILED: cannot build prompt for %s: %v\n", r.issueLabel(issue), err)
 		return resultFailed
 	}
 
-	logPath := filepath.Join(r.opts.LogDir, issue+".log")
-	r.printf(r.colors.Yellow, "Starting %s for issue #%s...\n", agentDisplayName(r.opts.Agent), issue)
+	logPath := filepath.Join(r.opts.LogDir, r.logFileName(issue))
+	r.printf(r.colors.Yellow, "Starting %s for %s...\n", agentDisplayName(r.opts.Agent), r.issueLabel(issue))
 	fmt.Printf("Log: %s\n", logPath)
 
-	exitCode, logOutput, err := r.runAgent(prompt, logPath)
-	if err != nil {
-		r.printf(r.colors.Red, "FAILED: %s invocation failed for #%s: %v\n", r.opts.Agent, issue, err)
-		return resultFailed
+	var exitCode int
+	var logOutput string
+
+	maxRetries := 3
+	retryDelay := 5 * time.Second
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			r.printf(r.colors.Yellow, "Retrying due to internal server error (attempt %d/%d)...\n", attempt, maxRetries)
+			time.Sleep(retryDelay)
+		}
+
+		exitCode, logOutput, err = r.runAgent(prompt, logPath)
+		if err != nil {
+			r.printf(r.colors.Red, "FAILED: %s invocation failed for %s: %v\n", r.opts.Agent, r.issueLabel(issue), err)
+			return resultFailed
+		}
+
+		if exitCode != 0 && detectInternalServerError(logOutput) {
+			if attempt < maxRetries {
+				continue
+			}
+		}
+		break
 	}
 
 	if detectSessionLimit(logOutput, r.opts.Agent, exitCode) {
 		if dirtyNow, dirtyErr := r.workingTreeDirty(); dirtyErr == nil && dirtyNow {
 			r.printf(r.colors.Yellow, "Session limit hit mid-work. Committing partial progress...\n")
-			message := fmt.Sprintf(
-				"wip: partial work on #%s - %s (session limit hit)\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
-				issue, details.Title,
-			)
+			var message string
+			if r.fileMode {
+				message = fmt.Sprintf(
+					"wip: partial work on %s - %s (session limit hit)\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+					issue, details.Title,
+				)
+			} else {
+				message = fmt.Sprintf(
+					"wip: partial work on #%s - %s (session limit hit)\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+					issue, details.Title,
+				)
+			}
 			if commitErr := r.commitAll(message); commitErr != nil {
 				r.printf(r.colors.Red, "FAILED: could not commit partial progress: %v\n", commitErr)
 				return resultFailed
@@ -706,7 +938,7 @@ func (r *runner) processIssue(idx, total int, issue string) issueResult {
 	}
 
 	if exitCode != 0 {
-		r.printf(r.colors.Red, "FAILED: %s exited with code %d for issue #%s\n", r.opts.Agent, exitCode, issue)
+		r.printf(r.colors.Red, "FAILED: %s exited with code %d for %s\n", r.opts.Agent, exitCode, r.issueLabel(issue))
 		r.printf(r.colors.Red, "Check log: %s\n", logPath)
 		return resultFailed
 	}
@@ -720,18 +952,18 @@ func (r *runner) processIssue(idx, total int, issue string) issueResult {
 	if endHead != startHead {
 		headMsg, _ := r.gitOutput("log", "-1", "--pretty=format:%s")
 		rangeSubjects, rangeErr := r.gitOutput("log", "--pretty=format:%s", fmt.Sprintf("%s..%s", startHead, endHead))
-		hasIssueRef := rangeErr == nil && issueMentionedInSubjects(rangeSubjects, issue)
+		hasIssueRef := r.fileMode || (rangeErr == nil && issueMentionedInSubjects(rangeSubjects, issue))
 
 		if err := r.markCompleted(issue); err != nil {
-			r.printf(r.colors.Red, "FAILED: could not mark #%s completed: %v\n", issue, err)
+			r.printf(r.colors.Red, "FAILED: could not mark %s completed: %v\n", r.issueLabel(issue), err)
 			return resultFailed
 		}
-		r.printf(r.colors.Green, "SUCCESS: Issue #%s committed by %s\n", issue, agentDisplayName(r.opts.Agent))
+		r.printf(r.colors.Green, "SUCCESS: %s committed by %s\n", r.issueLabel(issue), agentDisplayName(r.opts.Agent))
 		if strings.TrimSpace(headMsg) != "" {
 			r.printf(r.colors.Green, "Commit: %s\n", headMsg)
 		}
 		if !hasIssueRef {
-			r.printf(r.colors.Yellow, "WARNING: new commit(s) do not mention #%s in subject lines.\n", issue)
+			r.printf(r.colors.Yellow, "WARNING: new commit(s) do not mention %s in subject lines.\n", r.issueLabel(issue))
 		}
 		fmt.Println()
 		return resultSuccess
@@ -744,26 +976,39 @@ func (r *runner) processIssue(idx, total int, issue string) issueResult {
 	}
 	if dirty {
 		r.printf(r.colors.Yellow, "%s did not commit. Uncommitted changes found, committing now.\n", agentDisplayName(r.opts.Agent))
-		message := fmt.Sprintf(
-			"feat: implement #%s - %s\n\nCloses #%s\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
-			issue, details.Title, issue,
-		)
+		var message string
+		if r.fileMode {
+			message = fmt.Sprintf(
+				"feat: implement %s - %s\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+				issue, details.Title,
+			)
+		} else {
+			message = fmt.Sprintf(
+				"feat: implement #%s - %s\n\nCloses #%s\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+				issue, details.Title, issue,
+			)
+		}
 		if err := r.commitAll(message); err != nil {
-			r.printf(r.colors.Red, "FAILED: fallback commit failed for #%s: %v\n", issue, err)
+			r.printf(r.colors.Red, "FAILED: fallback commit failed for %s: %v\n", r.issueLabel(issue), err)
 			return resultFailed
 		}
 		if err := r.markCompleted(issue); err != nil {
-			r.printf(r.colors.Red, "FAILED: could not mark #%s completed: %v\n", issue, err)
+			r.printf(r.colors.Red, "FAILED: could not mark %s completed: %v\n", r.issueLabel(issue), err)
 			return resultFailed
 		}
-		r.printf(r.colors.Green, "SUCCESS: Issue #%s committed by runner\n", issue)
+		r.printf(r.colors.Green, "SUCCESS: %s committed by runner\n", r.issueLabel(issue))
 		fmt.Println()
 		return resultSuccess
 	}
 
-	r.printf(r.colors.Red, "FAILED: no changes produced for issue #%s\n", issue)
-	r.printf(r.colors.Red, "%s ran but made no modifications. Check log: %s\n", agentDisplayName(r.opts.Agent), logPath)
-	return resultFailed
+	r.printf(r.colors.Yellow, "No changes produced for %s (already done or no modifications needed)\n", r.issueLabel(issue))
+	if err := r.markCompleted(issue); err != nil {
+		r.printf(r.colors.Red, "FAILED: could not mark %s completed: %v\n", r.issueLabel(issue), err)
+		return resultFailed
+	}
+	r.printf(r.colors.Green, "SUCCESS: %s completed (no changes needed)\n", r.issueLabel(issue))
+	fmt.Println()
+	return resultSuccess
 }
 
 func issueMentionedInSubjects(subjects, issue string) bool {
@@ -792,6 +1037,9 @@ func issueMentionedInSubjects(subjects, issue string) bool {
 }
 
 func (r *runner) fetchIssueDetails(issue string) (issueDetails, error) {
+	if r.fileMode {
+		return r.fetchFileDetails(issue)
+	}
 	out, err := r.commandOutput(r.opts.GHBin, "issue", "view", issue, "--json", "title,body")
 	if err != nil {
 		return issueDetails{}, err
@@ -806,7 +1054,39 @@ func (r *runner) fetchIssueDetails(issue string) (issueDetails, error) {
 	return details, nil
 }
 
-func (r *runner) buildPrompt(issue string, details issueDetails) (string, error) {
+func (r *runner) fetchFileDetails(filePath string) (issueDetails, error) {
+	absPath := resolvePath(r.repoRoot, filePath)
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return issueDetails{}, fmt.Errorf("read file: %w", err)
+	}
+	content := string(data)
+	lines := strings.Split(content, "\n")
+
+	title := ""
+	bodyStart := 0
+	for i, line := range lines {
+		if strings.HasPrefix(line, "# ") {
+			title = strings.TrimSpace(strings.TrimPrefix(line, "# "))
+			bodyStart = i + 1
+			break
+		}
+	}
+
+	if title == "" {
+		base := filepath.Base(filePath)
+		title = strings.TrimSuffix(base, filepath.Ext(base))
+	}
+
+	body := ""
+	if bodyStart < len(lines) {
+		body = strings.TrimSpace(strings.Join(lines[bodyStart:], "\n"))
+	}
+
+	return issueDetails{Title: title, Body: body}, nil
+}
+
+func (r *runner) buildPrompt(issue string, details issueDetails, isResume bool) (string, error) {
 	templateBody := ""
 	if r.opts.PromptTemplate != "" {
 		data, err := os.ReadFile(r.opts.PromptTemplate)
@@ -814,6 +1094,8 @@ func (r *runner) buildPrompt(issue string, details issueDetails) (string, error)
 			return "", fmt.Errorf("read prompt template: %w", err)
 		}
 		templateBody = string(data)
+	} else if r.fileMode {
+		templateBody = defaultFilePromptBody
 	} else {
 		templateBody = defaultPromptBody
 	}
@@ -822,8 +1104,13 @@ func (r *runner) buildPrompt(issue string, details issueDetails) (string, error)
 		"{{ISSUE_NUMBER}}", issue,
 		"{{ISSUE_TITLE}}", details.Title,
 		"{{ISSUE_BODY}}", details.Body,
+		"{{FILE_PATH}}", issue,
 	)
-	return replacer.Replace(templateBody), nil
+	prompt := replacer.Replace(templateBody)
+	if isResume {
+		prompt += "\n\nNote: This work is being resumed from a previous agent so you need to check the latest commit first to see what's already done."
+	}
+	return prompt, nil
 }
 
 func (r *runner) runAgent(prompt, logPath string) (int, string, error) {
@@ -843,7 +1130,7 @@ func (r *runner) runAgent(prompt, logPath string) (int, string, error) {
 
 	var output io.Writer
 	var consoleWriter *consoleStreamWriter
-	if r.opts.StreamView == streamViewPretty && r.opts.Agent == "codex" {
+	if r.opts.StreamView == streamViewPretty && (r.opts.Agent == "codex" || r.opts.Agent == "cursor-agent" || r.opts.Agent == "gemini") {
 		consoleWriter = newConsoleStreamWriter(os.Stdout, renderer)
 		output = io.MultiWriter(logFile, consoleWriter)
 	} else {
@@ -996,6 +1283,175 @@ func (r *codexPrettyRenderer) FinalLines() []string {
 	return nil
 }
 
+type cursorAgentPrettyRenderer struct{}
+
+func (r *cursorAgentPrettyRenderer) ConsumeLine(line string) []string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return nil
+	}
+	if !strings.HasPrefix(trimmed, "{") {
+		return []string{line}
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &payload); err != nil {
+		return []string{line}
+	}
+
+	eventType, _ := payload["type"].(string)
+	if eventType != "result" {
+		return nil
+	}
+
+	subtype := getStringField(payload, "subtype")
+	isError := payload["is_error"] == true
+	durationMs, hasDuration := getIntField(payload, "duration_ms")
+	result := strings.TrimSpace(getStringField(payload, "result"))
+
+	var lines []string
+
+	// Header: [done] 56.9s or [error] ...
+	if isError {
+		errMsg := subtype
+		if errMsg == "" {
+			errMsg = "failed"
+		}
+		lines = append(lines, "[error] "+errMsg)
+	} else if hasDuration && durationMs > 0 {
+		sec := float64(durationMs) / 1000
+		lines = append(lines, fmt.Sprintf("[done] %.1fs", sec))
+	} else {
+		lines = append(lines, "[done]")
+	}
+
+	if result != "" {
+		for _, l := range prefixMultiline("[assistant] ", "  ", result) {
+			lines = append(lines, l)
+		}
+	}
+
+	return lines
+}
+
+func (r *cursorAgentPrettyRenderer) FinalLines() []string {
+	return nil
+}
+
+// geminiPrettyRenderer buffers Gemini's final JSON result and prints a short summary.
+type geminiPrettyRenderer struct {
+	jsonBuf    []string
+	braceCount int
+}
+
+func (r *geminiPrettyRenderer) ConsumeLine(line string) []string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return nil
+	}
+	// Suppress noisy boilerplate.
+	if strings.HasPrefix(trimmed, "YOLO mode is enabled") || trimmed == "Loaded cached credentials." {
+		return nil
+	}
+	// Show tool errors.
+	if strings.HasPrefix(trimmed, "Error executing tool ") {
+		return []string{line}
+	}
+	// Start or continue JSON buffer.
+	if r.braceCount > 0 || strings.HasPrefix(trimmed, "{") {
+		r.jsonBuf = append(r.jsonBuf, line)
+		for _, c := range trimmed {
+			if c == '{' {
+				r.braceCount++
+			} else if c == '}' {
+				r.braceCount--
+			}
+		}
+		if r.braceCount != 0 {
+			return nil
+		}
+		// Complete JSON object: parse and format.
+		block := strings.Join(r.jsonBuf, "\n")
+		r.jsonBuf = nil
+		r.braceCount = 0
+		return r.formatGeminiResult(block)
+	}
+	return nil
+}
+
+func (r *geminiPrettyRenderer) formatGeminiResult(block string) []string {
+	var payload struct {
+		Response string `json:"response"`
+		Stats    struct {
+			Models map[string]struct {
+				API struct {
+					TotalRequests  int `json:"totalRequests"`
+					TotalErrors    int `json:"totalErrors"`
+					TotalLatencyMs int `json:"totalLatencyMs"`
+				} `json:"api"`
+				Tokens struct {
+					Input      int `json:"input"`
+					Prompt     int `json:"prompt"`
+					Candidates int `json:"candidates"`
+					Total      int `json:"total"`
+					Cached     int `json:"cached"`
+					Thoughts   int `json:"thoughts"`
+					Tool       int `json:"tool"`
+				} `json:"tokens"`
+			} `json:"models"`
+			Tools struct {
+				TotalCalls      int `json:"totalCalls"`
+				TotalSuccess    int `json:"totalSuccess"`
+				TotalFail       int `json:"totalFail"`
+				TotalDurationMs int `json:"totalDurationMs"`
+			} `json:"tools"`
+			Files struct {
+				TotalLinesAdded   int `json:"totalLinesAdded"`
+				TotalLinesRemoved int `json:"totalLinesRemoved"`
+			} `json:"files"`
+		} `json:"stats"`
+	}
+	if err := json.Unmarshal([]byte(block), &payload); err != nil {
+		return []string{block}
+	}
+	var lines []string
+	// Assistant response (first few lines).
+	if payload.Response != "" {
+		for i, l := range compactMultiline(payload.Response, 0, 0) {
+			if i == 0 {
+				lines = append(lines, "[assistant] "+l)
+			} else {
+				lines = append(lines, "  "+l)
+			}
+		}
+	}
+	// Stats: tokens and API.
+	for _, m := range payload.Stats.Models {
+		lines = append(lines, fmt.Sprintf("  tokens: %d (cached %d) · requests: %d · latency: %.1fs",
+			m.Tokens.Total, m.Tokens.Cached, m.API.TotalRequests, float64(m.API.TotalLatencyMs)/1000))
+		break
+	}
+	// Tools summary.
+	t := payload.Stats.Tools
+	lines = append(lines, fmt.Sprintf("  tools: %d calls, %d ok, %d fail · %.1fs",
+		t.TotalCalls, t.TotalSuccess, t.TotalFail, float64(t.TotalDurationMs)/1000))
+	// Files.
+	f := payload.Stats.Files
+	if f.TotalLinesAdded != 0 || f.TotalLinesRemoved != 0 {
+		lines = append(lines, fmt.Sprintf("  files: +%d −%d", f.TotalLinesAdded, f.TotalLinesRemoved))
+	}
+	return lines
+}
+
+func (r *geminiPrettyRenderer) FinalLines() []string {
+	if len(r.jsonBuf) == 0 {
+		return nil
+	}
+	block := strings.Join(r.jsonBuf, "\n")
+	r.jsonBuf = nil
+	return r.formatGeminiResult(block)
+}
+
 type consoleStreamWriter struct {
 	out      io.Writer
 	renderer streamRenderer
@@ -1073,6 +1529,12 @@ func (r *runner) newStreamRenderer() (streamRenderer, string) {
 	}
 	if r.opts.Agent == "codex" {
 		return &codexPrettyRenderer{}, ""
+	}
+	if r.opts.Agent == "cursor-agent" {
+		return &cursorAgentPrettyRenderer{}, ""
+	}
+	if r.opts.Agent == "gemini" {
+		return &geminiPrettyRenderer{}, ""
 	}
 	return &rawStreamRenderer{}, fmt.Sprintf(
 		"Stream view %q is not implemented for %s yet; showing raw output.",
@@ -1279,7 +1741,22 @@ func (r *runner) markCompleted(issue string) error {
 		return fmt.Errorf("write done file: %w", err)
 	}
 	r.doneSet[issue] = struct{}{}
+	r.setIssueLabel(issue, "ghir:done")
 	return nil
+}
+
+func (r *runner) setIssueLabel(issue, newLabel string) {
+	if r.fileMode || r.opts.DryRun {
+		return
+	}
+	allLabels := []string{"ghir:queued", "ghir:running", "ghir:done"}
+	var toRemove []string
+	for _, l := range allLabels {
+		if l != newLabel {
+			toRemove = append(toRemove, l)
+		}
+	}
+	_, _ = r.commandOutput(r.opts.GHBin, "issue", "edit", issue, "--add-label", newLabel, "--remove-label", strings.Join(toRemove, ","))
 }
 
 func (r *runner) isCompleted(issue string) bool {
@@ -1418,8 +1895,27 @@ func waitDurationGemini(logOutput string, now time.Time, bufferSec int) (int, ti
 		}
 	}
 
+	// "No capacity available" / 429 from Gemini: retry after 15 minutes
+	lower := strings.ToLower(logOutput)
+	if strings.Contains(lower, "no capacity") || strings.Contains(lower, "retryablequotaerror") || strings.Contains(lower, "code: 429") {
+		wait := geminiCapacity429WaitSec + bufferSec
+		return wait, now.Add(time.Duration(wait) * time.Second)
+	}
+
 	wait := defaultFallbackWaitSec
 	return wait, now.Add(time.Duration(wait) * time.Second)
+}
+
+// isGemini429CapacityLog returns true if the log is from Gemini failing with 429 / no capacity.
+// The CLI prints this in multiple forms (JSON error body, stack trace, RetryableQuotaError).
+func isGemini429CapacityLog(logOutput string) bool {
+	lower := strings.ToLower(logOutput)
+	// Phrases that appear in the actual Gemini CLI output when capacity is exhausted
+	return strings.Contains(lower, "no capacity available") ||
+		strings.Contains(lower, "retryablequotaerror") ||
+		strings.Contains(lower, "model_capacity_exhausted") ||
+		(strings.Contains(lower, "resource_exhausted") && strings.Contains(lower, "429")) ||
+		strings.Contains(lower, "ratelimitexceeded")
 }
 
 func detectSessionLimit(logOutput, agent string, exitCode int) bool {
@@ -1444,6 +1940,9 @@ func detectSessionLimit(logOutput, agent string, exitCode int) bool {
 		return false
 	}
 	if agent == "gemini" {
+		if exitCode != 0 && isGemini429CapacityLog(logOutput) {
+			return true
+		}
 		if detectGeminiErrorPayloadLimit(logOutput) {
 			return true
 		}
@@ -1456,6 +1955,10 @@ func detectSessionLimit(logOutput, agent string, exitCode int) bool {
 		return false
 	}
 	return claudeSessionLimitPattern.MatchString(logOutput)
+}
+
+func detectInternalServerError(logOutput string) bool {
+	return internalServerErrorPattern.MatchString(logOutput)
 }
 
 func detectCodexErrorEventLimit(logOutput string) bool {
@@ -1567,6 +2070,20 @@ func (r *runner) commandOutput(name string, args ...string) (string, error) {
 
 	if err := cmd.Run(); err != nil {
 		out := strings.TrimSpace(buf.String())
+
+		if name == r.opts.GHBin {
+			lowerOut := strings.ToLower(out)
+			lowerErr := strings.ToLower(err.Error())
+			if strings.Contains(lowerOut, "auth") || strings.Contains(lowerOut, "credentials") || strings.Contains(lowerErr, "auth") || strings.Contains(lowerErr, "credentials") {
+				hint := "Hint: run `gh auth login` to authenticate or check repository permissions."
+				if out == "" {
+					out = hint
+				} else {
+					out = out + "\n" + hint
+				}
+			}
+		}
+
 		if out == "" {
 			return "", fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
 		}
@@ -1603,6 +2120,20 @@ func agentDisplayName(agent string) string {
 	}
 }
 
+func (r *runner) issueLabel(issue string) string {
+	if r.fileMode {
+		return issue
+	}
+	return "#" + issue
+}
+
+func (r *runner) logFileName(issue string) string {
+	if r.fileMode {
+		return strings.ReplaceAll(issue, "/", "__") + ".log"
+	}
+	return issue + ".log"
+}
+
 const defaultPromptBody = `You are implementing a fix or feature for GitHub issue #{{ISSUE_NUMBER}}.
 
 ## Issue: {{ISSUE_TITLE}}
@@ -1621,3 +2152,91 @@ const defaultPromptBody = `You are implementing a fix or feature for GitHub issu
    - "feat: <description> (closes #{{ISSUE_NUMBER}})" for features
 7. Do not push to remote. Commit locally only.
 `
+
+const defaultFilePromptBody = `You are implementing a task described in {{FILE_PATH}}.
+
+## Task: {{ISSUE_TITLE}}
+
+{{ISSUE_BODY}}
+
+## Instructions
+
+1. Read and understand the task above thoroughly.
+2. Study existing code and related files before making changes.
+3. Implement the fix or feature completely. No TODO placeholders.
+4. Run the appropriate quality checks and tests for files you modified.
+5. Fix any failing tests or lint issues.
+6. Create a git commit with:
+   - "fix: <description>" for bug fixes
+   - "feat: <description>" for features
+7. Do not push to remote. Commit locally only.
+`
+
+func runOnce(r *runner) (int, error) {
+	issues, err := r.loadIssues()
+	if err != nil {
+		return 0, err
+	}
+
+	if r.opts.Status {
+		r.printStatus(issues)
+		return 0, nil
+	}
+
+	r.printBanner(issues)
+
+	var wg sync.WaitGroup
+	for _, issue := range issues {
+		if !r.isCompleted(issue) {
+			wg.Add(1)
+			go func(i string) {
+				defer wg.Done()
+				r.setIssueLabel(i, "ghir:queued")
+			}(issue)
+		}
+	}
+	wg.Wait()
+
+	if r.opts.SingleIssue != "" {
+		r.opts.Force = true
+		result := r.processIssue(1, len(issues), issues[0], false)
+		if result != resultSuccess {
+			return 1, nil
+		}
+		return 0, nil
+	}
+
+	succeeded, failed := 0, 0
+	var failedIssues []string
+	for i, issue := range issues {
+		idx := i + 1
+		result := r.processIssue(idx, len(issues), issue, false)
+		for result == resultRetry {
+			r.printf(r.colors.Blue, "Retrying %s after session limit reset...\n", r.issueLabel(issue))
+			result = r.processIssue(idx, len(issues), issue, true)
+		}
+		if result == resultSuccess {
+			succeeded++
+			continue
+		}
+		failed++
+		failedIssues = append(failedIssues, r.issueLabel(issue))
+		if r.opts.ContinueOnError {
+			r.printf(r.colors.Red, "Failed on %s, continuing due to --continue-on-error\n", r.issueLabel(issue))
+			continue
+		}
+		r.printf(r.colors.Red, "Stopping due to failure on %s\n", r.issueLabel(issue))
+		break
+	}
+
+	fmt.Println()
+	r.printf(r.colors.Blue, "============================================================\n")
+	r.printf(r.colors.Green, "Succeeded: %d\n", succeeded)
+	r.printf(r.colors.Red, "Failed: %d\n", failed)
+	if len(failedIssues) > 0 {
+		r.printf(r.colors.Red, "Failed issues: %s\n", strings.Join(failedIssues, ", "))
+	}
+	r.printf(r.colors.Blue, "============================================================\n")
+
+	return failed, nil
+}
