@@ -46,9 +46,40 @@ Verify:
 ghir --help
 ```
 
-### 2) Configure a target repository
+### 2) Pick a workflow and run
 
-In the repo where you want to run tickets, create `.ticket-runner/issues.txt`:
+`ghir` runs from **inside** the git repository you want to change. You can feed it work in several ways:
+
+#### Pass issue numbers directly
+
+The quickest way to get started — no config files needed:
+
+```bash
+# One issue
+ghir --issue 1721
+
+# Multiple issues, comma-separated
+ghir --issues 1721,1706,1710
+```
+
+#### Process all open issues
+
+Point ghir at the repo's open issue backlog:
+
+```bash
+# All open issues
+ghir --all-open
+
+# Only issues with a specific label
+ghir --all-open --label bug
+
+# Loop forever, picking up new issues as they're filed
+ghir --all-open --loop
+```
+
+#### Use an issues file
+
+For a persistent, ordered queue, create `.ticket-runner/issues.txt` in the repo root:
 
 ```text
 # one issue id per line (processing order)
@@ -57,32 +88,79 @@ In the repo where you want to run tickets, create `.ticket-runner/issues.txt`:
 1710
 ```
 
-Optional prompt override: `.ticket-runner/prompt.tmpl`.
-
-Template placeholders:
-- `{{ISSUE_NUMBER}}`
-- `{{ISSUE_TITLE}}`
-- `{{ISSUE_BODY}}`
-
-### 3) First run
+Then run:
 
 ```bash
-cd /path/to/target-repo
-ghir --dry-run
-ghir
+ghir                # processes the file by default
+ghir --dry-run      # preview without running
 ```
+
+You can also point at an explicit file:
+
+```bash
+ghir --issues-file my-issues.txt
+```
+
+#### Run from markdown files (no GitHub issues needed)
+
+Put numbered `.md` files in a directory — the filename (or numeric prefix) determines processing order:
+
+```text
+tasks/
+  1-fix-auth.md
+  2-add-logging.md
+  3-refactor-api.md
+```
+
+Then run:
+
+```bash
+# All .md files in the directory, sorted numerically
+ghir --all-files tasks
+
+# Specific files
+ghir --files tasks/1-fix-auth.md,tasks/2-add-logging.md
+```
+
+This is useful when you want to batch independent tasks that aren't tied to GitHub issues — each file becomes its own work item with the file contents used as the prompt.
+
+#### Custom prompt template
+
+For any issue-based workflow, you can override the default prompt with `.ticket-runner/prompt.tmpl`:
+
+```text
+Fix issue #{{ISSUE_NUMBER}}: {{ISSUE_TITLE}}
+
+{{ISSUE_BODY}}
+```
+
+Or point to an explicit template:
+
+```bash
+ghir --prompt-template my-prompt.tmpl --issues 1721
+```
+
+Template placeholders: `{{ISSUE_NUMBER}}`, `{{ISSUE_TITLE}}`, `{{ISSUE_BODY}}`.
 
 ## Common Commands
 
 ```bash
-# Show queue state
+# Show queue state (works with any source)
 ghir --status
 
-# Process specific issues without creating issues.txt
-ghir --issues 1721,1706
+# Reprocess already-completed items
+ghir --force
 
-# Process one issue (forced re-run of that issue)
-ghir --issue 1710
+# Reset completion state
+ghir --reset          # reset all
+ghir --reset 1710    # reset one
+
+# Keep going when an item fails
+ghir --issues 1721,1706,1710 --continue-on-error
+
+# Control live console rendering
+ghir --stream-view pretty    # condensed events (default)
+ghir --stream-view raw       # passthrough output
 
 # Publish one PR per issue or file
 ghir --all-open --strategy pr-per-pass
@@ -91,16 +169,8 @@ ghir --all-files tasks --strategy pr-per-pass
 # Create one PR after the full queue
 ghir --issues 1721,1706 --strategy pr-at-end
 
-# Reprocess already completed issues
-ghir --force
-
-# Control live console rendering
-ghir --agent codex --stream-view pretty   # default
-ghir --stream-view raw
-
-# Reset completion state
-ghir --reset
-ghir --reset 1710
+# Chain PRs (each targets the previous branch)
+ghir --issues 1721,1706,1710 --strategy pr-chain
 ```
 
 ## Terminal UI (`ghir tui`)
