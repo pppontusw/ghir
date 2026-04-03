@@ -5,11 +5,34 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"ghir/streaming"
 )
+
+type fixedImproveModeRand struct {
+	picks []int
+	index int
+}
+
+func (r *fixedImproveModeRand) Intn(n int) int {
+	if len(r.picks) == 0 {
+		return 0
+	}
+	pick := r.picks[r.index%len(r.picks)]
+	r.index++
+	if pick < 0 {
+		pick = -pick
+	}
+	if n == 0 {
+		return 0
+	}
+	return pick % n
+}
 
 func TestParseArgsSupportedAgents(t *testing.T) {
 	t.Parallel()
@@ -22,6 +45,7 @@ func TestParseArgsSupportedAgents(t *testing.T) {
 		{name: "codex", agent: "codex"},
 		{name: "gemini", agent: "gemini"},
 		{name: "cursor-agent", agent: "cursor-agent"},
+		{name: "pi", agent: "pi"},
 	}
 
 	for _, tt := range tests {
@@ -35,6 +59,380 @@ func TestParseArgsSupportedAgents(t *testing.T) {
 			}
 			if opts.Agent != tt.agent {
 				t.Fatalf("agent mismatch: got %q want %q", opts.Agent, tt.agent)
+			}
+		})
+	}
+}
+
+func TestParseImproveArgsBasicFlags(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		args       []string
+		wantMode   string
+		wantPrompt string
+		wantFile   string
+		wantIter   int
+		wantLoop   bool
+		wantStrat  string
+		wantAgent  string
+		wantStream string
+	}{
+		{
+			name:       "defaults when no flags",
+			args:       []string{},
+			wantMode:   "cleanup",
+			wantIter:   1,
+			wantLoop:   false,
+			wantStrat:  "direct",
+			wantAgent:  "claude",
+			wantStream: streamViewPretty,
+		},
+		{
+			name:       "explicit mode and iterations and loop",
+			args:       []string{"--mode", "security", "--iterations", "3", "--loop", "--strategy", "pr-per-pass", "--agent", "gemini", "--stream-view", "raw"},
+			wantMode:   "security",
+			wantIter:   3,
+			wantLoop:   true,
+			wantStrat:  "pr-per-pass",
+			wantAgent:  "gemini",
+			wantStream: streamViewRaw,
+		},
+		{
+			name:       "pr-chain strategy",
+			args:       []string{"--strategy", "pr-chain"},
+			wantMode:   "cleanup",
+			wantIter:   1,
+			wantStrat:  "pr-chain",
+			wantAgent:  "claude",
+			wantStream: streamViewPretty,
+		},
+		{
+			name:       "pr-at-end strategy",
+			args:       []string{"--strategy", "pr-at-end"},
+			wantMode:   "cleanup",
+			wantIter:   1,
+			wantStrat:  "pr-at-end",
+			wantAgent:  "claude",
+			wantStream: streamViewPretty,
+		},
+		{
+			name:       "new mode docs",
+			args:       []string{"--mode", "docs"},
+			wantMode:   "docs",
+			wantIter:   1,
+			wantLoop:   false,
+			wantStrat:  "direct",
+			wantAgent:  "claude",
+			wantStream: streamViewPretty,
+		},
+		{
+			name:       "new mode a11y",
+			args:       []string{"--mode", "a11y"},
+			wantMode:   "a11y",
+			wantIter:   1,
+			wantLoop:   false,
+			wantStrat:  "direct",
+			wantAgent:  "claude",
+			wantStream: streamViewPretty,
+		},
+		{
+			name:       "new mode bugfix",
+			args:       []string{"--mode", "bugfix"},
+			wantMode:   "bugfix",
+			wantIter:   1,
+			wantLoop:   false,
+			wantStrat:  "direct",
+			wantAgent:  "claude",
+			wantStream: streamViewPretty,
+		},
+		{
+			name:       "comma separated mode list",
+			args:       []string{"--mode", "Refactor, cleanup"},
+			wantMode:   "refactor,cleanup",
+			wantIter:   1,
+			wantLoop:   false,
+			wantStrat:  "direct",
+			wantAgent:  "claude",
+			wantStream: streamViewPretty,
+		},
+		{
+			name:       "inline prompt",
+			args:       []string{"--prompt", "custom improve prompt"},
+			wantMode:   "cleanup",
+			wantPrompt: "custom improve prompt",
+			wantIter:   1,
+			wantLoop:   false,
+			wantStrat:  "direct",
+			wantAgent:  "claude",
+			wantStream: streamViewPretty,
+		},
+		{
+			name:       "prompt file",
+			args:       []string{"--prompt-file", "prompts/improve.txt"},
+			wantMode:   "cleanup",
+			wantFile:   "prompts/improve.txt",
+			wantIter:   1,
+			wantLoop:   false,
+			wantStrat:  "direct",
+			wantAgent:  "claude",
+			wantStream: streamViewPretty,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := parseImproveArgs(tt.args)
+			if err != nil {
+				t.Fatalf("parseImproveArgs returned unexpected error: %v", err)
+			}
+			if got.Mode != tt.wantMode {
+				t.Fatalf("Mode mismatch: got %q want %q", got.Mode, tt.wantMode)
+			}
+			if got.Prompt != tt.wantPrompt {
+				t.Fatalf("Prompt mismatch: got %q want %q", got.Prompt, tt.wantPrompt)
+			}
+			if got.PromptFile != tt.wantFile {
+				t.Fatalf("PromptFile mismatch: got %q want %q", got.PromptFile, tt.wantFile)
+			}
+			if strings.Contains(tt.wantMode, ",") {
+				if gotModes, wantModes := got.ModeList, strings.Split(tt.wantMode, ","); !slices.Equal(gotModes, wantModes) {
+					t.Fatalf("ModeList mismatch: got %v want %v", gotModes, wantModes)
+				}
+			}
+			if got.Iterations != tt.wantIter {
+				t.Fatalf("Iterations mismatch: got %d want %d", got.Iterations, tt.wantIter)
+			}
+			if got.Loop != tt.wantLoop {
+				t.Fatalf("Loop mismatch: got %v want %v", got.Loop, tt.wantLoop)
+			}
+			if got.Strategy != tt.wantStrat {
+				t.Fatalf("Strategy mismatch: got %q want %q", got.Strategy, tt.wantStrat)
+			}
+			if got.Agent != tt.wantAgent {
+				t.Fatalf("Agent mismatch: got %q want %q", got.Agent, tt.wantAgent)
+			}
+			if got.StreamView != tt.wantStream {
+				t.Fatalf("StreamView mismatch: got %q want %q", got.StreamView, tt.wantStream)
+			}
+		})
+	}
+}
+
+func TestParseImproveArgsValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "invalid mode",
+			args:    []string{"--mode", "unknown"},
+			wantErr: "--mode must be one of",
+		},
+		{
+			name:    "mode list empty entry",
+			args:    []string{"--mode", "cleanup,,refactor"},
+			wantErr: "--mode cannot contain empty entries",
+		},
+		{
+			name:    "mode list duplicate entry",
+			args:    []string{"--mode", "cleanup,refactor,cleanup"},
+			wantErr: "--mode cannot contain duplicate entries",
+		},
+		{
+			name:    "mode list cannot combine mixed",
+			args:    []string{"--mode", "mixed,cleanup"},
+			wantErr: "--mode cannot combine mixed with other modes",
+		},
+		{
+			name:    "invalid strategy",
+			args:    []string{"--strategy", "branch"},
+			wantErr: "--strategy must be one of",
+		},
+		{
+			name:    "iterations zero without loop",
+			args:    []string{"--iterations", "0"},
+			wantErr: "--iterations must be positive unless --loop is set",
+		},
+		{
+			name:    "invalid agent",
+			args:    []string{"--agent", "nope"},
+			wantErr: "--agent must be one of",
+		},
+		{
+			name:    "invalid stream view",
+			args:    []string{"--stream-view", "minimal"},
+			wantErr: "--stream-view must be one of",
+		},
+		{
+			name:    "missing mode value",
+			args:    []string{"--mode"},
+			wantErr: "--mode requires a value",
+		},
+		{
+			name:    "prompt and prompt file conflict",
+			args:    []string{"--prompt", "custom", "--prompt-file", "prompts/improve.txt"},
+			wantErr: "--prompt and --prompt-file cannot be combined",
+		},
+		{
+			name:    "mode conflicts with prompt",
+			args:    []string{"--mode", "security", "--prompt", "custom"},
+			wantErr: "--mode cannot be combined with --prompt or --prompt-file",
+		},
+		{
+			name:    "mode conflicts with prompt file",
+			args:    []string{"--mode", "security", "--prompt-file", "prompts/improve.txt"},
+			wantErr: "--mode cannot be combined with --prompt or --prompt-file",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := parseImproveArgs(tt.args)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("unexpected error: got %q want substring %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseImproveArgsIterationsWithLoop(t *testing.T) {
+	t.Parallel()
+
+	got, err := parseImproveArgs([]string{"--loop", "--iterations", "0"})
+	if err != nil {
+		t.Fatalf("parseImproveArgs returned unexpected error: %v", err)
+	}
+	if !got.Loop {
+		t.Fatalf("Loop mismatch: got %v want true", got.Loop)
+	}
+	if got.Iterations != 0 {
+		t.Fatalf("Iterations mismatch: got %d want %d", got.Iterations, 0)
+	}
+}
+
+func TestParseTUIArgsBasicFlags(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		args        []string
+		wantMode    string
+		wantPreset  string
+		wantExp     bool
+		wantNoColor bool
+		wantHelp    bool
+	}{
+		{
+			name: "defaults",
+			args: []string{},
+		},
+		{
+			name:       "mode and preset and experimental",
+			args:       []string{"--mode", "files", "--load-preset", "daily", "--experimental"},
+			wantMode:   "files",
+			wantPreset: "daily",
+			wantExp:    true,
+		},
+		{
+			name:        "no color flag",
+			args:        []string{"--no-color"},
+			wantNoColor: true,
+		},
+		{
+			name:     "help flag",
+			args:     []string{"--help"},
+			wantHelp: true,
+		},
+		{
+			name:     "short help flag",
+			args:     []string{"-h"},
+			wantHelp: true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := parseTUIArgs(tt.args)
+			if err != nil {
+				t.Fatalf("parseTUIArgs returned unexpected error: %v", err)
+			}
+			if got.Mode != tt.wantMode {
+				t.Fatalf("Mode mismatch: got %q want %q", got.Mode, tt.wantMode)
+			}
+			if got.LoadPreset != tt.wantPreset {
+				t.Fatalf("LoadPreset mismatch: got %q want %q", got.LoadPreset, tt.wantPreset)
+			}
+			if got.Experimental != tt.wantExp {
+				t.Fatalf("Experimental mismatch: got %v want %v", got.Experimental, tt.wantExp)
+			}
+			if got.NoColor != tt.wantNoColor {
+				t.Fatalf("NoColor mismatch: got %v want %v", got.NoColor, tt.wantNoColor)
+			}
+			if got.Help != tt.wantHelp {
+				t.Fatalf("Help mismatch: got %v want %v", got.Help, tt.wantHelp)
+			}
+		})
+	}
+}
+
+func TestParseTUIArgsValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "invalid mode",
+			args:    []string{"--mode", "queue"},
+			wantErr: "--mode must be one of: issues, files, improve",
+		},
+		{
+			name:    "missing mode value",
+			args:    []string{"--mode"},
+			wantErr: "--mode requires a value",
+		},
+		{
+			name:    "missing preset value",
+			args:    []string{"--load-preset"},
+			wantErr: "--load-preset requires a value",
+		},
+		{
+			name:    "unknown flag",
+			args:    []string{"--agent", "codex"},
+			wantErr: "unknown option: --agent",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := parseTUIArgs(tt.args)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("unexpected error: got %q want substring %q", err.Error(), tt.wantErr)
 			}
 		})
 	}
@@ -89,6 +487,21 @@ func TestParseArgsModelParsing(t *testing.T) {
 				t.Fatalf("model mismatch: got %q want %q", opts.Model, tt.wantModel)
 			}
 		})
+	}
+}
+
+func TestParseArgsPiBinParsing(t *testing.T) {
+	t.Parallel()
+
+	opts, err := parseArgs([]string{"--agent", "pi", "--pi-bin", "/usr/local/bin/pi"})
+	if err != nil {
+		t.Fatalf("parseArgs returned unexpected error: %v", err)
+	}
+	if opts.Agent != "pi" {
+		t.Fatalf("agent mismatch: got %q want %q", opts.Agent, "pi")
+	}
+	if opts.PiBin != "/usr/local/bin/pi" {
+		t.Fatalf("pi bin mismatch: got %q want %q", opts.PiBin, "/usr/local/bin/pi")
 	}
 }
 
@@ -469,6 +882,67 @@ func TestParseArgsContinueOnError(t *testing.T) {
 	}
 }
 
+func TestParseArgsStrategy(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		args      []string
+		want      string
+		wantError string
+	}{
+		{
+			name: "default strategy",
+			args: []string{"--issues", "1,2"},
+			want: "direct",
+		},
+		{
+			name: "pr per pass strategy",
+			args: []string{"--issues", "1,2", "--strategy", "pr-per-pass"},
+			want: "pr-per-pass",
+		},
+		{
+			name: "pr chain strategy",
+			args: []string{"--all-files", "tasks", "--strategy", "pr-chain"},
+			want: "pr-chain",
+		},
+		{
+			name: "pr at end strategy",
+			args: []string{"--issue", "7", "--strategy", "pr-at-end"},
+			want: "pr-at-end",
+		},
+		{
+			name:      "invalid strategy",
+			args:      []string{"--issue", "7", "--strategy", "branch"},
+			wantError: "--strategy must be one of: direct, pr-per-pass, pr-chain, pr-at-end",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			opts, err := parseArgs(tt.args)
+			if tt.wantError != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.wantError)
+				}
+				if !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("unexpected error: got %q want substring %q", err.Error(), tt.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseArgs returned unexpected error: %v", err)
+			}
+			if opts.Strategy != tt.want {
+				t.Fatalf("strategy mismatch: got %q want %q", opts.Strategy, tt.want)
+			}
+		})
+	}
+}
+
 func TestSortStringsNumeric(t *testing.T) {
 	t.Parallel()
 
@@ -569,7 +1043,7 @@ func TestParseArgsInvalidAgent(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for invalid agent")
 	}
-	if !strings.Contains(err.Error(), "--agent must be one of: claude, codex, gemini, cursor-agent") {
+	if !strings.Contains(err.Error(), "--agent must be one of: claude, codex, gemini, cursor-agent, pi") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -723,6 +1197,13 @@ func TestDetectSessionLimitByAgent(t *testing.T) {
 			exitCode: 1,
 			retry:    false,
 		},
+		{
+			name:     "pi is always non retryable even with limit text",
+			agent:    "pi",
+			log:      "quota exceeded, try again later",
+			exitCode: 1,
+			retry:    false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -793,6 +1274,103 @@ func TestDetectInternalServerError(t *testing.T) {
 			t.Parallel()
 			if got := detectInternalServerError(tt.log); got != tt.want {
 				t.Fatalf("detectInternalServerError(%q) = %v, want %v", tt.log, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDetectExpiredAuthTokenError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		log      string
+		exitCode int
+		want     bool
+	}{
+		{
+			name:     "pi ide token expired",
+			log:      "401 IDE token expired: unauthorized: token expired",
+			exitCode: 1,
+			want:     true,
+		},
+		{
+			name:     "token expired without nonzero exit is ignored",
+			log:      "401 IDE token expired: unauthorized: token expired",
+			exitCode: 0,
+			want:     false,
+		},
+		{
+			name:     "unrelated auth error is not retried",
+			log:      "401 unauthorized: invalid credentials",
+			exitCode: 1,
+			want:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := detectExpiredAuthTokenError(tt.log, tt.exitCode); got != tt.want {
+				t.Fatalf("detectExpiredAuthTokenError(%q, %d) = %v, want %v", tt.log, tt.exitCode, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDetectRetryableAgentError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		agent    string
+		log      string
+		exitCode int
+		want     string
+		ok       bool
+	}{
+		{
+			name:     "internal server error stays retryable",
+			agent:    "codex",
+			log:      "503 Service Unavailable",
+			exitCode: 1,
+			want:     "internal server error",
+			ok:       true,
+		},
+		{
+			name:     "pi expired ide token becomes retryable",
+			agent:    "pi",
+			log:      "401 IDE token expired: unauthorized: token expired",
+			exitCode: 1,
+			want:     "expired IDE token",
+			ok:       true,
+		},
+		{
+			name:     "non pi token expiry uses generic reason",
+			agent:    "codex",
+			log:      "401 unauthorized: token expired",
+			exitCode: 1,
+			want:     "expired auth token",
+			ok:       true,
+		},
+		{
+			name:     "unrelated error is not retryable",
+			agent:    "pi",
+			log:      "authentication failed",
+			exitCode: 1,
+			want:     "",
+			ok:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := detectRetryableAgentError(tt.log, tt.agent, tt.exitCode)
+			if got != tt.want || ok != tt.ok {
+				t.Fatalf("detectRetryableAgentError(%q, %q, %d) = (%q, %v), want (%q, %v)", tt.log, tt.agent, tt.exitCode, got, ok, tt.want, tt.ok)
 			}
 		})
 	}
@@ -910,6 +1488,13 @@ func TestWaitDurationCodex(t *testing.T) {
 			wantReset:   now.Add(165 * time.Second),
 		},
 		{
+			name:        "uses try again at time when present",
+			log:         `[error] You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 3:35 PM.`,
+			bufferSec:   120,
+			wantWaitSec: 2220,
+			wantReset:   now.Add(2220 * time.Second),
+		},
+		{
 			name:        "falls back on malformed values",
 			log:         `usage limit; resets_in_seconds: nope`,
 			bufferSec:   120,
@@ -984,15 +1569,15 @@ func TestWaitDurationGemini(t *testing.T) {
 			name:        "no capacity 429 uses 15 min wait",
 			log:         "No capacity available for model gemini-3-pro-preview on the server. RetryableQuotaError",
 			bufferSec:   120,
-			wantWaitSec: geminiCapacity429WaitSec + 120,
-			wantReset:   now.Add(time.Duration(geminiCapacity429WaitSec+120) * time.Second),
+			wantWaitSec: geminiCapacity429Wait + 120,
+			wantReset:   now.Add(time.Duration(geminiCapacity429Wait+120) * time.Second),
 		},
 		{
 			name:        "code 429 uses 15 min wait",
 			log:         "Error: cause: { code: 429, message: 'No capacity available' }",
 			bufferSec:   0,
-			wantWaitSec: geminiCapacity429WaitSec,
-			wantReset:   now.Add(time.Duration(geminiCapacity429WaitSec) * time.Second),
+			wantWaitSec: geminiCapacity429Wait,
+			wantReset:   now.Add(time.Duration(geminiCapacity429Wait) * time.Second),
 		},
 	}
 
@@ -1065,30 +1650,32 @@ func TestNewStreamRenderer(t *testing.T) {
 
 			r := &runner{
 				opts: options{
-					Agent:      tt.agent,
-					StreamView: tt.streamView,
+					agentConfig: agentConfig{
+						Agent:      tt.agent,
+						StreamView: tt.streamView,
+					},
 				},
 			}
 
 			gotRenderer, gotNotice := r.newStreamRenderer()
 			if tt.wantCodexPretty {
-				if _, ok := gotRenderer.(*codexPrettyRenderer); !ok {
-					t.Fatalf("renderer type mismatch: got %T want *codexPrettyRenderer", gotRenderer)
+				if _, ok := gotRenderer.(*streaming.CodexPrettyRenderer); !ok {
+					t.Fatalf("renderer type mismatch: got %T want *streaming.CodexPrettyRenderer", gotRenderer)
 				}
 			}
 			if tt.wantCursorAgentPretty {
-				if _, ok := gotRenderer.(*cursorAgentPrettyRenderer); !ok {
-					t.Fatalf("renderer type mismatch: got %T want *cursorAgentPrettyRenderer", gotRenderer)
+				if _, ok := gotRenderer.(*streaming.CursorAgentPrettyRenderer); !ok {
+					t.Fatalf("renderer type mismatch: got %T want *streaming.CursorAgentPrettyRenderer", gotRenderer)
 				}
 			}
 			if tt.wantGeminiPretty {
-				if _, ok := gotRenderer.(*geminiPrettyRenderer); !ok {
-					t.Fatalf("renderer type mismatch: got %T want *geminiPrettyRenderer", gotRenderer)
+				if _, ok := gotRenderer.(*streaming.GeminiPrettyRenderer); !ok {
+					t.Fatalf("renderer type mismatch: got %T want *streaming.GeminiPrettyRenderer", gotRenderer)
 				}
 			}
 			if tt.wantRaw {
-				if _, ok := gotRenderer.(*rawStreamRenderer); !ok {
-					t.Fatalf("renderer type mismatch: got %T want *rawStreamRenderer", gotRenderer)
+				if _, ok := gotRenderer.(*streaming.RawRenderer); !ok {
+					t.Fatalf("renderer type mismatch: got %T want *streaming.RawRenderer", gotRenderer)
 				}
 			}
 			if tt.wantNoticeSubstr == "" {
@@ -1107,7 +1694,7 @@ func TestNewStreamRenderer(t *testing.T) {
 func TestCodexPrettyRenderer(t *testing.T) {
 	t.Parallel()
 
-	renderer := &codexPrettyRenderer{}
+	renderer := &streaming.CodexPrettyRenderer{}
 
 	t.Run("shows command start", func(t *testing.T) {
 		t.Parallel()
@@ -1165,7 +1752,7 @@ func TestCodexPrettyRenderer(t *testing.T) {
 func TestCursorAgentPrettyRenderer(t *testing.T) {
 	t.Parallel()
 
-	renderer := &cursorAgentPrettyRenderer{}
+	renderer := &streaming.CursorAgentPrettyRenderer{}
 
 	t.Run("shows success result with duration and content", func(t *testing.T) {
 		t.Parallel()
@@ -1225,7 +1812,7 @@ func TestGeminiPrettyRenderer(t *testing.T) {
 
 	t.Run("suppresses YOLO and credentials", func(t *testing.T) {
 		t.Parallel()
-		r := &geminiPrettyRenderer{}
+		r := &streaming.GeminiPrettyRenderer{}
 		if got := r.ConsumeLine("YOLO mode is enabled. All tool calls will be automatically approved."); got != nil {
 			t.Fatalf("expected suppress, got %v", got)
 		}
@@ -1236,7 +1823,7 @@ func TestGeminiPrettyRenderer(t *testing.T) {
 
 	t.Run("passes through tool errors", func(t *testing.T) {
 		t.Parallel()
-		r := &geminiPrettyRenderer{}
+		r := &streaming.GeminiPrettyRenderer{}
 		line := "Error executing tool replace: Error: Failed to edit, expected 4 occurrences but found 1."
 		got := r.ConsumeLine(line)
 		if len(got) != 1 || got[0] != line {
@@ -1246,7 +1833,7 @@ func TestGeminiPrettyRenderer(t *testing.T) {
 
 	t.Run("formats single-line result JSON", func(t *testing.T) {
 		t.Parallel()
-		r := &geminiPrettyRenderer{}
+		r := &streaming.GeminiPrettyRenderer{}
 		line := `{"session_id":"abc","response":"Done.","stats":{"models":{"m1":{"api":{"totalRequests":2,"totalErrors":0,"totalLatencyMs":5000},"tokens":{"input":100,"prompt":200,"candidates":50,"total":350,"cached":0,"thoughts":0,"tool":0}}},"tools":{"totalCalls":5,"totalSuccess":5,"totalFail":0,"totalDurationMs":1200},"files":{"totalLinesAdded":10,"totalLinesRemoved":2}}}`
 		got := r.ConsumeLine(line)
 		if len(got) < 3 {
@@ -1313,6 +1900,161 @@ func TestMainInvalidFlagsExitNonZero(t *testing.T) {
 				t.Fatalf("output mismatch: got %q want substring %q", string(output), tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestMainTUIHelp(t *testing.T) {
+	t.Parallel()
+
+	cmdArgs := []string{"-test.run=TestMainHelperProcess", "--", "tui", "--help"}
+	cmd := exec.Command(os.Args[0], cmdArgs...)
+	cmd.Env = append(os.Environ(), "GHIR_TEST_HELPER_PROCESS=1")
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("expected zero exit, got %v with output %s", err, string(output))
+	}
+
+	out := string(output)
+	if !strings.Contains(out, "ghir tui [options]") {
+		t.Fatalf("expected TUI usage, got %q", out)
+	}
+	if !strings.Contains(out, "--mode <issues|files|improve>") {
+		t.Fatalf("expected TUI mode flag in help, got %q", out)
+	}
+	if !strings.Contains(out, "--no-color") {
+		t.Fatalf("expected no-color flag in help, got %q", out)
+	}
+	if !strings.Contains(out, "Accepted for backward compatibility; no longer required") {
+		t.Fatalf("expected rollout compatibility note in help, got %q", out)
+	}
+}
+
+func TestMainTUIBootstrapsWithoutExperimentalFlag(t *testing.T) {
+	t.Parallel()
+
+	repo := initMainTestRepo(t)
+	writeMainTestFile(t, filepath.Join(repo, "tasks", "bootstrap", "1.md"), "bootstrap\n")
+
+	cmdArgs := []string{"-test.run=TestMainHelperProcess", "--", "tui", "--mode", "files"}
+	cmd := exec.Command(os.Args[0], cmdArgs...)
+	cmd.Dir = repo
+	cmd.Env = append(os.Environ(), "GHIR_TEST_HELPER_PROCESS=1", "GHIR_TUI_TEST=1", "NO_COLOR=1", "HOME="+repo)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("expected zero exit, got %v with output %s", err, string(output))
+	}
+
+	out := string(output)
+	if !strings.Contains(out, "Phase Configure") {
+		t.Fatalf("expected TUI shell top bar, got %q", out)
+	}
+	if !strings.Contains(out, "Run Setup") || !strings.Contains(out, "Directory scan") {
+		t.Fatalf("expected workflow bootstrap in output, got %q", out)
+	}
+}
+
+func TestMainTUIExperimentalBootstrap(t *testing.T) {
+	t.Parallel()
+
+	repo := initMainTestRepo(t)
+	writeMainTestFile(t, filepath.Join(repo, ".ticket-runner", "tui-presets.json"), `{
+  "version": 1,
+  "presets": [
+    {
+      "name": "daily",
+      "workflow": "files",
+      "fields": {
+        "source": "all-files",
+        "all_files": "tasks/bootstrap",
+        "agent": "codex",
+        "stream_view": "raw"
+      }
+    }
+  ]
+}`)
+	writeMainTestFile(t, filepath.Join(repo, "tasks", "bootstrap", "1.md"), "bootstrap\n")
+	cmd := exec.Command("git", "add", ".")
+	cmd.Dir = repo
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git add failed: %v (%s)", err, string(output))
+	}
+	cmd = exec.Command("git", "commit", "-m", "bootstrap preset fixture")
+	cmd.Dir = repo
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git commit failed: %v (%s)", err, string(output))
+	}
+
+	cmdArgs := []string{"-test.run=TestMainHelperProcess", "--", "tui", "--experimental", "--load-preset", "daily"}
+	cmd = exec.Command(os.Args[0], cmdArgs...)
+	cmd.Dir = repo
+	cmd.Env = append(os.Environ(), "GHIR_TEST_HELPER_PROCESS=1", "GHIR_TUI_TEST=1", "NO_COLOR=1", "HOME="+repo)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("expected zero exit, got %v with output %s", err, string(output))
+	}
+
+	out := string(output)
+	if !strings.Contains(out, "Phase Configure") {
+		t.Fatalf("expected TUI shell top bar, got %q", out)
+	}
+	if !strings.Contains(out, "Run Setup") || !strings.Contains(out, "Directory scan") {
+		t.Fatalf("expected selected workflow in output, got %q", out)
+	}
+	if !strings.Contains(out, "Preset: daily") {
+		t.Fatalf("expected selected preset in output, got %q", out)
+	}
+	if !strings.Contains(out, "Agent Codex") {
+		t.Fatalf("expected loaded preset agent in output, got %q", out)
+	}
+	if !strings.Contains(out, "tasks/bootstrap") {
+		t.Fatalf("expected loaded preset source in output, got %q", out)
+	}
+}
+
+func initMainTestRepo(t *testing.T) string {
+	t.Helper()
+
+	repo := t.TempDir()
+	cmd := exec.Command("git", "init", "-b", "main")
+	cmd.Dir = repo
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init failed: %v (%s)", err, string(output))
+	}
+	cmd = exec.Command("git", "config", "user.name", "Test User")
+	cmd.Dir = repo
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git config user.name failed: %v (%s)", err, string(output))
+	}
+	cmd = exec.Command("git", "config", "user.email", "test@example.com")
+	cmd.Dir = repo
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git config user.email failed: %v (%s)", err, string(output))
+	}
+	writeMainTestFile(t, filepath.Join(repo, ".gitkeep"), "")
+	cmd = exec.Command("git", "add", ".gitkeep")
+	cmd.Dir = repo
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git add failed: %v (%s)", err, string(output))
+	}
+	cmd = exec.Command("git", "commit", "-m", "initial")
+	cmd.Dir = repo
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git commit failed: %v (%s)", err, string(output))
+	}
+	return repo
+}
+
+func writeMainTestFile(t *testing.T, path, content string) {
+	t.Helper()
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
 	}
 }
 
@@ -1623,6 +2365,231 @@ func TestBuildPromptIssueModeUnchanged(t *testing.T) {
 	}
 }
 
+func TestBuildImprovePromptModesAndPlaceholders(t *testing.T) {
+	t.Parallel()
+
+	repoRoot := t.TempDir()
+
+	iopts := improveOptions{
+		Mode:  "cleanup",
+		Scope: "backend/",
+	}
+
+	prompt, mode, err := buildImprovePrompt(iopts, repoRoot, "main", 2)
+	if err != nil {
+		t.Fatalf("buildImprovePrompt returned unexpected error: %v", err)
+	}
+	if mode != "cleanup" {
+		t.Fatalf("effective mode mismatch: got %q want %q", mode, "cleanup")
+	}
+	if !strings.Contains(prompt, "cleanup") {
+		t.Fatalf("prompt should mention cleanup, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "backend/") {
+		t.Fatalf("prompt should contain scope, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "descriptive message") {
+		t.Fatalf("prompt should instruct descriptive commit message, got:\n%s", prompt)
+	}
+}
+
+func TestBuildImprovePromptQualityModeFocusesSingleImprovementAndDelegation(t *testing.T) {
+	t.Parallel()
+
+	repoRoot := t.TempDir()
+	iopts := improveOptions{
+		Mode:  "quality",
+		Scope: "internal/",
+	}
+
+	prompt, mode, err := buildImprovePrompt(iopts, repoRoot, "main", 1)
+	if err != nil {
+		t.Fatalf("buildImprovePrompt returned unexpected error: %v", err)
+	}
+	if mode != "quality" {
+		t.Fatalf("effective mode mismatch: got %q want %q", mode, "quality")
+	}
+	if !strings.Contains(prompt, "one significant code-quality improvement") {
+		t.Fatalf("prompt should emphasize a single significant improvement, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "delegate them to subagents") {
+		t.Fatalf("prompt should mention subagent delegation, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "internal/") {
+		t.Fatalf("prompt should contain scope, got:\n%s", prompt)
+	}
+}
+
+func TestBuildImprovePromptBugfixModePrioritizesConcreteDefects(t *testing.T) {
+	t.Parallel()
+
+	repoRoot := t.TempDir()
+	iopts := improveOptions{
+		Mode:  "bugfix",
+		Scope: "pkg/service/",
+	}
+
+	prompt, mode, err := buildImprovePrompt(iopts, repoRoot, "main", 1)
+	if err != nil {
+		t.Fatalf("buildImprovePrompt returned unexpected error: %v", err)
+	}
+	if mode != "bugfix" {
+		t.Fatalf("effective mode mismatch: got %q want %q", mode, "bugfix")
+	}
+	if !strings.Contains(prompt, "one coherent bug fix") {
+		t.Fatalf("prompt should emphasize one coherent bug fix, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "failing bugs first") {
+		t.Fatalf("prompt should prioritize failing bugs first, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "high-confidence general bug") {
+		t.Fatalf("prompt should mention high-confidence general bugs, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "regression tests") {
+		t.Fatalf("prompt should mention regression tests, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "pkg/service/") {
+		t.Fatalf("prompt should contain scope, got:\n%s", prompt)
+	}
+}
+
+func TestBuildImprovePromptMixedModeCycles(t *testing.T) {
+	t.Parallel()
+
+	repoRoot := t.TempDir()
+	iopts := improveOptions{
+		Mode: "mixed",
+	}
+
+	modes := make(map[string]bool)
+	for i := 1; i <= 14; i++ {
+		_, mode, err := buildImprovePrompt(iopts, repoRoot, "main", i)
+		if err != nil {
+			t.Fatalf("buildImprovePrompt returned unexpected error at iteration %d: %v", i, err)
+		}
+		modes[mode] = true
+	}
+
+	expectedModes := []string{"cleanup", "quality", "refactor", "security", "bugfix", "dead-code", "docs", "tests", "deps", "perf", "a11y", "errors", "types", "logging"}
+	for _, expected := range expectedModes {
+		if !modes[expected] {
+			t.Fatalf("expected mixed mode to include %q, got %v", expected, modes)
+		}
+	}
+}
+
+func TestBuildImprovePromptExplicitModeListUsesRandomSelection(t *testing.T) {
+	t.Parallel()
+
+	repoRoot := t.TempDir()
+	iopts := improveOptions{
+		Mode:     "cleanup,refactor",
+		ModeList: []string{"cleanup", "refactor"},
+		Scope:    "cmd/",
+		modeRand: &fixedImproveModeRand{picks: []int{1, 1}},
+	}
+
+	firstPrompt, firstMode, err := buildImprovePrompt(iopts, repoRoot, "main", 1)
+	if err != nil {
+		t.Fatalf("buildImprovePrompt returned unexpected error: %v", err)
+	}
+	if firstMode != "refactor" {
+		t.Fatalf("expected random mode selection to pick refactor, got %q", firstMode)
+	}
+	if !strings.Contains(firstPrompt, "structural refactoring pass") {
+		t.Fatalf("expected refactor prompt body, got:\n%s", firstPrompt)
+	}
+
+	secondPrompt, secondMode, err := buildImprovePrompt(iopts, repoRoot, "main", 2)
+	if err != nil {
+		t.Fatalf("buildImprovePrompt returned unexpected error on second pass: %v", err)
+	}
+	if secondMode != "refactor" {
+		t.Fatalf("expected repeated selections to be allowed, got %q", secondMode)
+	}
+	if !strings.Contains(secondPrompt, "cmd/") {
+		t.Fatalf("expected prompt to contain scope, got:\n%s", secondPrompt)
+	}
+}
+
+func TestBuildImprovePRAtEndSummaryMultiModeListsConfiguredModes(t *testing.T) {
+	t.Parallel()
+
+	title, body := buildImprovePRAtEndSummary(improveOptions{
+		Mode:     "cleanup,refactor",
+		ModeList: []string{"cleanup", "refactor"},
+	}, []string{"chore: cleanup pass 1", "chore: refactor pass 2"})
+
+	if title != "chore: multi-mode improvements" {
+		t.Fatalf("unexpected title: %q", title)
+	}
+	if !strings.Contains(body, "Automated ghir improve passes in multi mode.") {
+		t.Fatalf("expected multi aggregate mode in body, got:\n%s", body)
+	}
+	if !strings.Contains(body, "Configured modes: cleanup, refactor") {
+		t.Fatalf("expected configured mode list in body, got:\n%s", body)
+	}
+	if !strings.Contains(body, "- chore: cleanup pass 1") || !strings.Contains(body, "- chore: refactor pass 2") {
+		t.Fatalf("expected commit summary in body, got:\n%s", body)
+	}
+}
+
+func TestBuildImprovePromptInlineCustomPrompt(t *testing.T) {
+	t.Parallel()
+
+	repoRoot := t.TempDir()
+	iopts := improveOptions{
+		Mode:       "cleanup",
+		Prompt:     "Custom improve prompt.\nKeep it literal.",
+		AvoidFiles: []string{"README.md"},
+	}
+
+	prompt, mode, err := buildImprovePrompt(iopts, repoRoot, "main", 1)
+	if err != nil {
+		t.Fatalf("buildImprovePrompt returned unexpected error: %v", err)
+	}
+	if mode != improveCustomMode {
+		t.Fatalf("effective mode mismatch: got %q want %q", mode, improveCustomMode)
+	}
+	if !strings.Contains(prompt, "Custom improve prompt.\nKeep it literal.") {
+		t.Fatalf("prompt should contain inline custom prompt, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "README.md") {
+		t.Fatalf("prompt should contain avoid-files note, got:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "Optional focus path:") {
+		t.Fatalf("custom prompt should not inject built-in mode template text, got:\n%s", prompt)
+	}
+}
+
+func TestBuildImprovePromptFileCustomPrompt(t *testing.T) {
+	t.Parallel()
+
+	repoRoot := t.TempDir()
+	promptPath := filepath.Join(repoRoot, "prompts", "improve.txt")
+	if err := os.MkdirAll(filepath.Dir(promptPath), 0o755); err != nil {
+		t.Fatalf("create prompt dir: %v", err)
+	}
+	if err := os.WriteFile(promptPath, []byte("Prompt from file."), 0o644); err != nil {
+		t.Fatalf("write prompt file: %v", err)
+	}
+
+	iopts := improveOptions{
+		PromptFile: promptPath,
+	}
+
+	prompt, mode, err := buildImprovePrompt(iopts, repoRoot, "main", 1)
+	if err != nil {
+		t.Fatalf("buildImprovePrompt returned unexpected error: %v", err)
+	}
+	if mode != improveCustomMode {
+		t.Fatalf("effective mode mismatch: got %q want %q", mode, improveCustomMode)
+	}
+	if prompt != "Prompt from file." {
+		t.Fatalf("prompt mismatch: got %q want %q", prompt, "Prompt from file.")
+	}
+}
+
 func TestLogFileName(t *testing.T) {
 	t.Parallel()
 
@@ -1798,6 +2765,11 @@ func TestParseArgsLoopValidation(t *testing.T) {
 			name:    "loop with issue (invalid)",
 			args:    []string{"--loop", "--issue", "1"},
 			wantErr: "--loop requires either --all-open or --all-files",
+		},
+		{
+			name:    "loop with pr strategy is invalid",
+			args:    []string{"--loop", "--all-open", "--strategy", "pr-per-pass"},
+			wantErr: "--loop is only supported with --strategy direct",
 		},
 	}
 

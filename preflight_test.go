@@ -52,18 +52,22 @@ func TestPreflightChecks(t *testing.T) {
 		{
 			name: "all binaries present",
 			opts: options{
-				Agent:     "claude",
-				ClaudeBin: dummyClaude,
-				GHBin:     dummyGH,
+				agentConfig: agentConfig{
+					Agent:     "claude",
+					ClaudeBin: dummyClaude,
+					GHBin:     dummyGH,
+				},
 			},
 			fileMode: false,
 		},
 		{
 			name: "missing gh in issue mode",
 			opts: options{
-				Agent:     "claude",
-				ClaudeBin: dummyClaude,
-				GHBin:     "/path/to/missing/gh",
+				agentConfig: agentConfig{
+					Agent:     "claude",
+					ClaudeBin: dummyClaude,
+					GHBin:     "/path/to/missing/gh",
+				},
 			},
 			fileMode:  false,
 			wantError: "missing required binary 'gh'",
@@ -71,18 +75,22 @@ func TestPreflightChecks(t *testing.T) {
 		{
 			name: "missing gh in file mode (should be ignored)",
 			opts: options{
-				Agent:     "claude",
-				ClaudeBin: dummyClaude,
-				GHBin:     "/path/to/missing/gh",
+				agentConfig: agentConfig{
+					Agent:     "claude",
+					ClaudeBin: dummyClaude,
+					GHBin:     "/path/to/missing/gh",
+				},
 			},
 			fileMode: true,
 		},
 		{
 			name: "missing agent binary",
 			opts: options{
-				Agent:     "claude",
-				ClaudeBin: "/path/to/missing/claude",
-				GHBin:     dummyGH,
+				agentConfig: agentConfig{
+					Agent:     "claude",
+					ClaudeBin: "/path/to/missing/claude",
+					GHBin:     dummyGH,
+				},
 			},
 			fileMode:  false,
 			wantError: "missing required binary 'claude'",
@@ -90,12 +98,26 @@ func TestPreflightChecks(t *testing.T) {
 		{
 			name: "missing specific agent binary (gemini)",
 			opts: options{
-				Agent:     "gemini",
-				GeminiBin: "/path/to/missing/gemini",
-				GHBin:     dummyGH,
+				agentConfig: agentConfig{
+					Agent:     "gemini",
+					GeminiBin: "/path/to/missing/gemini",
+					GHBin:     dummyGH,
+				},
 			},
 			fileMode:  false,
 			wantError: "missing required binary 'gemini'",
+		},
+		{
+			name: "missing specific agent binary (pi)",
+			opts: options{
+				agentConfig: agentConfig{
+					Agent: "pi",
+					PiBin: "/path/to/missing/pi",
+					GHBin: dummyGH,
+				},
+			},
+			fileMode:  false,
+			wantError: "missing required binary 'pi'",
 		},
 	}
 

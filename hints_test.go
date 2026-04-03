@@ -24,7 +24,7 @@ func TestGHAuthFailureHint(t *testing.T) {
 
 	r := &runner{
 		opts: options{
-			GHBin: "bash",
+			agentConfig: agentConfig{GHBin: "bash"},
 		},
 		repoRoot: ".",
 	}
@@ -47,7 +47,7 @@ func TestGHAuthFailureHint_NoAuthError(t *testing.T) {
 
 	r := &runner{
 		opts: options{
-			GHBin: "bash",
+			agentConfig: agentConfig{GHBin: "bash"},
 		},
 		repoRoot: ".",
 	}

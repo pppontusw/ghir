@@ -1,6 +1,6 @@
 # ghir
 
-Queue-driven GitHub issue runner for agent CLIs (`claude`, `codex`, `gemini`, `cursor-agent`).
+Queue-driven GitHub issue runner for agent CLIs (`claude`, `codex`, `gemini`, `cursor-agent`, `pi`).
 
 It processes issues one-by-one in a controlled order, stores completion state per repository, writes logs per issue, and supports agent/model overrides.
 
@@ -14,6 +14,7 @@ It processes issues one-by-one in a controlled order, stores completion state pe
   - `codex`
   - `gemini`
   - `cursor-agent`
+  - `pi`
 
 ## Quick Start
 
@@ -83,6 +84,13 @@ ghir --issues 1721,1706
 # Process one issue (forced re-run of that issue)
 ghir --issue 1710
 
+# Publish one PR per issue or file
+ghir --all-open --strategy pr-per-pass
+ghir --all-files tasks --strategy pr-per-pass
+
+# Create one PR after the full queue
+ghir --issues 1721,1706 --strategy pr-at-end
+
 # Reprocess already completed issues
 ghir --force
 
@@ -95,6 +103,56 @@ ghir --reset
 ghir --reset 1710
 ```
 
+## Terminal UI (`ghir tui`)
+
+Use the TUI when you want guided configuration with command transparency instead of manually composing flags.
+
+```bash
+# Open the TUI directly
+ghir tui
+
+# Start on a specific workflow
+ghir tui --mode files
+
+# Load a saved preset at startup
+ghir tui --load-preset daily
+
+# Force plain-text rendering
+ghir tui --no-color
+```
+
+The TUI stays thin over the existing CLI. The command rail always shows the exact `ghir` invocation that will be executed, and runs still go through the normal subprocess path.
+
+Phases:
+- `Configure`: choose workflow, source, agent, model, and run.
+- `Run`: monitor queue status, stream output, retries, session waits, and log paths.
+- `Summary`: inspect succeeded/failed items, rerun failures, reset completion markers, or return to configure with state preserved.
+
+Workflow coverage:
+- `Issues`: `--issue`, `--issues`, `--issues-file`, `--all-open`, optional `--label`, `--strategy`.
+- `Files`: `--files`, `--all-files`, `--strategy`.
+- `Improve`: `ghir improve` mode/strategy/iterations/loop/scope controls.
+
+Keybindings:
+- `J/K` or arrow keys: move within the active pane.
+- `Enter`: edit or apply the focused item.
+- `Space`: toggle booleans in configure.
+- `R`: run from configure, or rerun failed subset from summary.
+- `C`: copy the full command rail invocation.
+- `S`: save the current setup as a preset.
+- `L`: load a saved preset.
+- `O`: open the selected log path during a run.
+- `/`: search the failed-items list during summary or the active queue during a run.
+- `?`: show keyboard help.
+- `Q`: quit. During a run it requests a graceful stop first.
+
+Limits and behavior:
+- `NO_COLOR=1` or `ghir tui --no-color` keeps the UI readable without ANSI styling.
+- TUI presets are stored by default in `~/.ticket-runner/tui-presets.json`.
+- If no user-level preset file exists, the TUI still loads the legacy repo-local `.ticket-runner/tui-presets.json` if present.
+- Improve runs do not support summary actions that rerun only failed passes or reset completion markers.
+- The legacy `--experimental` flag is still accepted, but it is no longer required.
+
 ## Agent and Model Selection
 
 `--agent` supports:
@@ -102,17 +160,26 @@ ghir --reset 1710
 - `codex`
 - `gemini`
 - `cursor-agent`
+- `pi`
+
+If `--model` is omitted, ghir applies built-in defaults by agent:
+- `claude`: `opus`
+- `codex`: `gpt-5.4`
+- `gemini`: `gemini-3.1-pro-preview`
+- `cursor-agent`: `auto`
+- `pi`: `github-copilot/gpt-5.4:high`
 
 Use `--model` to override model per run:
 
 ```bash
-ghir --agent claude --model claude-3-5-sonnet-20241022 --issues 1721,1706
-ghir --agent codex --model gpt-4o --issues 1721,1706
-ghir --agent gemini --model gemini-1.5-pro --issues 1721,1706
-ghir --agent cursor-agent --model claude-3.5-sonnet --issues 1721,1706
+ghir --agent claude --model sonnet --issues 1721,1706
+ghir --agent codex --model gpt-5.3-codex --issues 1721,1706
+ghir --agent gemini --model gemini-3-flash-preview --issues 1721,1706
+ghir --agent cursor-agent --model opus-4.6-thinking --issues 1721,1706
+ghir --agent pi --model github-copilot/gpt-5.4:high --issues 1721,1706
 ```
 
-*Note: Maps to `--model` natively for Claude, Codex, and Cursor Agent, and `-m` for Gemini.*
+*Note: Maps to `--model` natively for Claude, Codex, Cursor Agent, and pi, and `-m` for Gemini. pi runs in non-interactive mode via `pi -p`.*
 
 Streaming view:
 - `--stream-view pretty` (default): condensed event rendering for Codex, cursor-agent, and Gemini JSON output.
@@ -128,6 +195,105 @@ For each target repository:
 
 This means progress is isolated per repo.
 
+## Normal Run Strategies
+
+Standard issue/file runs support the same strategy flag as improve mode:
+
+- `--strategy direct` (default): run on the current branch and commit locally.
+- `--strategy pr-per-pass`: create one feature branch and PR per issue/file item.
+- `--strategy pr-chain`: create a stack of PRs, where each later PR targets the previous PR branch.
+- `--strategy pr-at-end`: run the full issue/file queue on one feature branch and open a single PR at the end.
+
+Notes:
+
+- `--loop` is only supported with `--strategy direct` for normal issue/file runs.
+- File workflows only require `gh` when you choose a PR-based strategy.
+- PR-based strategies require a working `origin` remote and authenticated `gh` CLI.
+
+## Continuous Improvement Mode (`ghir improve`)
+
+When you have spare tokens or want background refactors, you can run **continuous improvement passes** that let your agent clean up the repo without tying work to specific issues.
+
+Basic usage:
+
+```bash
+# One cleanup pass on the current branch (direct commits)
+ghir improve --mode cleanup --iterations 1
+
+# One custom inline improve prompt
+ghir improve --prompt "Audit the repo for flaky tests and fix one high-confidence case." --iterations 1
+
+# Load a custom improve prompt from a file
+ghir improve --prompt-file prompts/improve.txt --strategy pr-per-pass
+
+# Security hardening pass, looping until you stop it (Ctrl+C)
+ghir improve --mode security --loop
+
+# Randomly choose between cleanup and refactor on each pass
+ghir improve --mode cleanup,refactor --iterations 5
+
+# Dead-code removal pass focused on a subdirectory
+ghir improve --mode dead-code --scope backend/
+```
+
+Modes:
+
+- `cleanup`: Light-touch polish: readability, style consistency, small simplifications.
+- `quality`: Reduce one meaningful suppression or disabled-check cluster per pass, fixing all surfaced issues until the repo is green again.
+- `refactor`: Structural changes: extract functions/classes, move code, improve interfaces and abstractions.
+- `security`: Scans for and fixes obvious security issues and misconfigurations.
+- `bugfix`: Prioritizes one coherent fix per pass: failing bugs first, then high-confidence defects, then small stability hardening if no clearer bug exists.
+- `dead-code`: Finds and removes unused code, configuration, and assets (conservatively).
+- `docs`: Adds or improves README, docstrings, API docs, and inline comments.
+- `tests`: Adds unit tests, edge cases, and integration tests where valuable.
+- `deps`: Updates dependencies, removes unused ones, fixes deprecation warnings.
+- `perf`: Finds and fixes obvious performance inefficiencies.
+- `a11y`: Improves accessibility in web UIs (ARIA, keyboard nav, focus, contrast).
+- `errors`: Improves error messages, logging, and handling of failure paths.
+- `types`: Adds types, fixes type errors, satisfies stricter linters.
+- `logging`: Adds structured logging, metrics, and tracing where helpful.
+- `mixed`: Rotates through all modes each pass.
+- `cleanup,refactor,...`: Randomly picks one of the listed built-in modes on each pass. Repeats are allowed. `mixed` cannot be combined with other modes.
+
+Strategies:
+
+- Direct commits (default):
+  - `--strategy direct`
+  - Runs on the current branch.
+  - Each pass creates a commit like `chore: cleanup pass 1`.
+
+- PR-per-pass:
+  - `--strategy pr-per-pass`
+  - Detects the current branch, creates a unique feature branch per pass (e.g. `ghir/improve-cleanup-1-a3f7b2c1`), runs the improvement there, pushes it, and opens a PR via `gh pr create`.
+  - Returns to your starting branch before moving on.
+- PR-chain:
+  - `--strategy pr-chain`
+  - Creates a chain of PRs. The first pass branches from your current branch and opens a PR against the default branch. Each subsequent pass branches from the previous pass's branch and opens a PR against it.
+- PR-at-end:
+  - `--strategy pr-at-end`
+  - Branches from your current branch, applies all improvement passes directly to the single new branch, and opens a single PR against the default branch at the end containing all iterations.
+
+Other useful flags:
+
+- `--prompt <text>`: Use inline custom improve prompt text instead of a built-in `--mode`.
+- `--prompt-file <path>`: Load custom improve prompt text from a file instead of a built-in `--mode`.
+- `--iterations <N>`: Number of passes to run (default `1`).
+- `--loop`: Run passes continuously until interrupted (when combined with `--iterations 0`, it runs indefinitely).
+- `--agent`, `--model`, `--stream-view`, `--no-color`, `--wait-buffer-sec`, and `--*-bin` flags work the same as in normal `ghir` runs.
+
+Notes:
+
+- `--prompt` and `--prompt-file` are mutually exclusive.
+- Custom prompt runs use `custom` for improve branch/log/commit/PR labeling.
+- Custom prompts replace built-in prompt selection, so they cannot be combined with `--mode`.
+- Comma-separated `--mode` lists are CLI-only; TUI improve mode selection remains single-select.
+
+Safety:
+
+- Requires a clean working tree before starting (just like normal `ghir`).
+- Reuses the same agent invocation, streaming, and session-limit handling as issue mode.
+- For `pr-per-pass`, `pr-chain`, and `pr-at-end`, you must have a working `origin` remote and authenticated `gh` CLI.
+
 ## Safety and Failure Behavior
 
 - Must run inside a git repository.
@@ -138,6 +304,8 @@ This means progress is isolated per repo.
   - `codex`
   - `gemini`
 - `cursor-agent` monthly quota/resource exhaustion is treated as non-retryable.
+- `pi` session/quota failures are currently treated as non-retryable.
+- Transient auth refresh failures such as `401 IDE token expired: unauthorized: token expired` are retried automatically.
 
 ## Development Commands
 
