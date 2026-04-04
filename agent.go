@@ -148,7 +148,12 @@ func (r *runner) buildAgentCommand(prompt string) (*exec.Cmd, error) {
 		cmd := exec.Command(agentBin, args...)
 		return cmd, nil
 	case "pi":
-		args := appendModelIfSet([]string{"-p"}, model, "--model")
+		var args []string
+		if r.opts.StreamView == streamViewPretty {
+			args = appendModelIfSet([]string{"--mode", "json"}, model, "--model")
+		} else {
+			args = appendModelIfSet([]string{"-p"}, model, "--model")
+		}
 		args = append(args, prompt)
 		cmd := exec.Command(agentBin, args...)
 		return cmd, nil

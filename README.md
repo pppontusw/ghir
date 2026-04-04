@@ -249,10 +249,10 @@ ghir --agent cursor-agent --model opus-4.6-thinking --issues 1721,1706
 ghir --agent pi --model github-copilot/gpt-5.4:high --issues 1721,1706
 ```
 
-*Note: Maps to `--model` natively for Claude, Codex, Cursor Agent, and pi, and `-m` for Gemini. pi runs in non-interactive mode via `pi -p`.*
+*Note: Maps to `--model` natively for Claude, Codex, Cursor Agent, and pi, and `-m` for Gemini. pi runs in non-interactive mode via `pi -p` for raw output and `pi --mode json` for pretty streaming.*
 
 Streaming view:
-- `--stream-view pretty` (default): condensed event rendering for Codex, cursor-agent, and Gemini JSON output.
+- `--stream-view pretty` (default): condensed event rendering for Codex, cursor-agent, Gemini, and pi JSON output.
 - `--stream-view raw`: passthrough raw agent output to console.
 - For other agents, `pretty` falls back to raw passthrough with a notice.
 

@@ -1355,6 +1355,30 @@ func TestDetectRetryableAgentError(t *testing.T) {
 			ok:       true,
 		},
 		{
+			name:     "pi successful run does not retry on embedded overloaded text",
+			agent:    "pi",
+			log:      `{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"errorMessage":"529 overloaded_error: Overloaded"}`,
+			exitCode: 0,
+			want:     "",
+			ok:       false,
+		},
+		{
+			name:     "pi json terminal error is retryable",
+			agent:    "pi",
+			log:      `{"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":"529 overloaded_error: Overloaded"}}`,
+			exitCode: 1,
+			want:     "internal server error",
+			ok:       true,
+		},
+		{
+			name:     "pi json non error content does not trigger retry",
+			agent:    "pi",
+			log:      strings.Join([]string{`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"the service says overloaded today"}}`, `{"type":"message_end","message":{"role":"assistant","stopReason":"stop"}}`}, "\n"),
+			exitCode: 1,
+			want:     "",
+			ok:       false,
+		},
+		{
 			name:     "unrelated error is not retryable",
 			agent:    "pi",
 			log:      "authentication failed",
@@ -1607,6 +1631,7 @@ func TestNewStreamRenderer(t *testing.T) {
 		wantCodexPretty       bool
 		wantCursorAgentPretty bool
 		wantGeminiPretty      bool
+		wantPiPretty          bool
 		wantRaw               bool
 		wantNoticeSubstr      string
 	}{
@@ -1627,6 +1652,12 @@ func TestNewStreamRenderer(t *testing.T) {
 			agent:            "gemini",
 			streamView:       streamViewPretty,
 			wantGeminiPretty: true,
+		},
+		{
+			name:         "pi pretty renderer for pi pretty view",
+			agent:        "pi",
+			streamView:   streamViewPretty,
+			wantPiPretty: true,
 		},
 		{
 			name:       "raw renderer for raw view",
@@ -1671,6 +1702,11 @@ func TestNewStreamRenderer(t *testing.T) {
 			if tt.wantGeminiPretty {
 				if _, ok := gotRenderer.(*streaming.GeminiPrettyRenderer); !ok {
 					t.Fatalf("renderer type mismatch: got %T want *streaming.GeminiPrettyRenderer", gotRenderer)
+				}
+			}
+			if tt.wantPiPretty {
+				if _, ok := gotRenderer.(*streaming.PiPrettyRenderer); !ok {
+					t.Fatalf("renderer type mismatch: got %T want *streaming.PiPrettyRenderer", gotRenderer)
 				}
 			}
 			if tt.wantRaw {
@@ -1851,6 +1887,97 @@ func TestGeminiPrettyRenderer(t *testing.T) {
 		}
 		if !strings.Contains(joined, "files:") {
 			t.Fatalf("missing files stats in %s", joined)
+		}
+	})
+}
+
+func TestPiPrettyRenderer(t *testing.T) {
+	t.Parallel()
+
+	t.Run("streams thinking and assistant text in realtime", func(t *testing.T) {
+		t.Parallel()
+
+		r := &streaming.PiPrettyRenderer{}
+
+		if got := r.ConsumeLine(`{"type":"session","version":3}`); got != nil {
+			t.Fatalf("expected session header to be suppressed, got %v", got)
+		}
+		if got := r.ConsumeLine(`{"type":"message_update","assistantMessageEvent":{"type":"thinking_start","contentIndex":0}}`); got != nil {
+			t.Fatalf("expected no output for thinking_start, got %v", got)
+		}
+		got := r.ConsumeLine(`{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"plan first\nplan second"}}`)
+		if len(got) != 1 || got[0] != "[thinking] plan first" {
+			t.Fatalf("unexpected thinking delta output: %v", got)
+		}
+		got = r.ConsumeLine(`{"type":"message_update","assistantMessageEvent":{"type":"thinking_end","contentIndex":0}}`)
+		if len(got) != 1 || got[0] != "  plan second" {
+			t.Fatalf("unexpected thinking end output: %v", got)
+		}
+
+		if got := r.ConsumeLine(`{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":1}}`); got != nil {
+			t.Fatalf("expected no output for text_start, got %v", got)
+		}
+		got = r.ConsumeLine(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"hello\nworld"}}`)
+		if len(got) != 1 || got[0] != "[assistant] hello" {
+			t.Fatalf("unexpected text delta output: %v", got)
+		}
+		got = r.ConsumeLine(`{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":1}}`)
+		if len(got) != 1 || got[0] != "  world" {
+			t.Fatalf("unexpected text end output: %v", got)
+		}
+	})
+
+	t.Run("shows tool starts and streams bash output", func(t *testing.T) {
+		t.Parallel()
+
+		r := &streaming.PiPrettyRenderer{}
+		got := r.ConsumeLine(`{"type":"tool_execution_start","toolCallId":"call_1","toolName":"bash","args":{"command":"go test ./..."}}`)
+		if len(got) != 1 || got[0] != "[bash] go test ./..." {
+			t.Fatalf("unexpected tool start output: %v", got)
+		}
+
+		got = r.ConsumeLine(`{"type":"tool_execution_update","toolCallId":"call_1","toolName":"bash","args":{"command":"go test ./..."},"partialResult":{"content":[{"type":"text","text":"line 1\nline 2"}]}}`)
+		if len(got) != 1 || got[0] != "  line 1" {
+			t.Fatalf("unexpected tool update output: %v", got)
+		}
+
+		got = r.ConsumeLine(`{"type":"tool_execution_end","toolCallId":"call_1","toolName":"bash","result":{"content":[{"type":"text","text":"line 1\nline 2\nok"}]},"isError":false}`)
+		if len(got) != 2 || got[0] != "  line 2" || got[1] != "  ok" {
+			t.Fatalf("unexpected tool end output: %v", got)
+		}
+	})
+
+	t.Run("flushes pending text and surfaces assistant errors", func(t *testing.T) {
+		t.Parallel()
+
+		r := &streaming.PiPrettyRenderer{}
+		if got := r.ConsumeLine(`{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":0}}`); got != nil {
+			t.Fatalf("expected no output for text_start, got %v", got)
+		}
+		if got := r.ConsumeLine(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"partial response"}}`); got != nil {
+			t.Fatalf("expected pending partial text, got %v", got)
+		}
+		got := r.ConsumeLine(`{"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":"model overloaded"}}`)
+		if len(got) != 2 {
+			t.Fatalf("unexpected line count: %v", got)
+		}
+		if got[0] != "[assistant] partial response" {
+			t.Fatalf("unexpected flushed text line: %q", got[0])
+		}
+		if got[1] != "[error] model overloaded" {
+			t.Fatalf("unexpected error line: %q", got[1])
+		}
+	})
+
+	t.Run("flushes final pending text from FinalLines", func(t *testing.T) {
+		t.Parallel()
+
+		r := &streaming.PiPrettyRenderer{}
+		_ = r.ConsumeLine(`{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":0}}`)
+		_ = r.ConsumeLine(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"final chunk without newline"}}`)
+		got := r.FinalLines()
+		if len(got) != 1 || got[0] != "[assistant] final chunk without newline" {
+			t.Fatalf("unexpected final flush output: %v", got)
 		}
 	})
 }

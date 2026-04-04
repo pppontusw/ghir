@@ -219,6 +219,12 @@ func detectExpiredAuthTokenError(logOutput string, exitCode int) bool {
 }
 
 func detectRetryableAgentError(logOutput, agent string, exitCode int) (string, bool) {
+	if exitCode == 0 {
+		return "", false
+	}
+	if agent == "pi" {
+		return detectPiRetryableAgentError(logOutput)
+	}
 	if detectInternalServerError(logOutput) {
 		return "internal server error", true
 	}
@@ -310,6 +316,113 @@ func detectGeminiErrorPayloadLimit(logOutput string) bool {
 		combined := strings.Join(messageParts, " ")
 		return geminiSessionLimitPattern.MatchString(combined)
 	})
+}
+
+func detectPiRetryableAgentError(logOutput string) (string, bool) {
+	sawJSON := false
+	if matched := forEachJSONLine(logOutput, func(payload map[string]any) bool {
+		sawJSON = true
+		for _, message := range piRetryableErrorMessages(payload) {
+			if detectExpiredAuthTokenError(message, 1) {
+				return true
+			}
+			if detectInternalServerError(message) {
+				return true
+			}
+		}
+		return false
+	}); matched {
+		for _, raw := range strings.Split(logOutput, "\n") {
+			line := strings.TrimSpace(raw)
+			if line == "" || !strings.HasPrefix(line, "{") {
+				continue
+			}
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(line), &payload); err != nil {
+				continue
+			}
+			for _, message := range piRetryableErrorMessages(payload) {
+				if detectExpiredAuthTokenError(message, 1) {
+					return "expired IDE token", true
+				}
+				if detectInternalServerError(message) {
+					return "internal server error", true
+				}
+			}
+		}
+	}
+	if sawJSON {
+		return "", false
+	}
+	if detectExpiredAuthTokenError(logOutput, 1) {
+		return "expired IDE token", true
+	}
+	if detectInternalServerError(logOutput) {
+		return "internal server error", true
+	}
+	return "", false
+}
+
+func piRetryableErrorMessages(payload map[string]any) []string {
+	eventType, _ := payload["type"].(string)
+	switch eventType {
+	case "message_end":
+		message := sessionAnyMap(payload["message"])
+		if sessionStringField(message, "role") != "assistant" {
+			return nil
+		}
+		stopReason := sessionStringField(message, "stopReason")
+		if stopReason != "error" && stopReason != "aborted" {
+			return nil
+		}
+		if errorMessage := strings.TrimSpace(sessionStringField(message, "errorMessage")); errorMessage != "" {
+			return []string{errorMessage}
+		}
+	case "message_update":
+		event := sessionAnyMap(payload["assistantMessageEvent"])
+		if sessionStringField(event, "type") != "error" {
+			return nil
+		}
+		message := sessionAnyMap(event["error"])
+		if errorMessage := strings.TrimSpace(sessionStringField(message, "errorMessage")); errorMessage != "" {
+			return []string{errorMessage}
+		}
+	case "auto_retry_end":
+		if payload["success"] == true {
+			return nil
+		}
+		if errorMessage := strings.TrimSpace(sessionStringField(payload, "finalError")); errorMessage != "" {
+			return []string{errorMessage}
+		}
+	case "extension_error":
+		if errorMessage := strings.TrimSpace(sessionStringField(payload, "error")); errorMessage != "" {
+			return []string{errorMessage}
+		}
+	}
+	return nil
+}
+
+func sessionAnyMap(value any) map[string]any {
+	m, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	return m
+}
+
+func sessionStringField(fields map[string]any, key string) string {
+	if fields == nil {
+		return ""
+	}
+	value, ok := fields[key]
+	if !ok || value == nil {
+		return ""
+	}
+	text, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return text
 }
 
 func parseGeminiDurationSeconds(durationText string) int {

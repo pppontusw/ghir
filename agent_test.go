@@ -36,7 +36,7 @@ func TestBuildAgentCommandUsesBuiltInDefaultModelWhenUnset(t *testing.T) {
 		{
 			name:     "pi default model",
 			agent:    "pi",
-			wantArgv: []string{"pi", "-p", "--model", "github-copilot/gpt-5.4:high"},
+			wantArgv: []string{"pi", "--mode", "json", "--model", "github-copilot/gpt-5.4:high"},
 		},
 	}
 
@@ -58,6 +58,24 @@ func TestBuildAgentCommandUsesBuiltInDefaultModelWhenUnset(t *testing.T) {
 				t.Fatalf("argv prefix mismatch:\n got: %v\nwant: %v", got, want)
 			}
 		})
+	}
+}
+
+func TestBuildAgentCommandUsesPiPrintModeForRawStream(t *testing.T) {
+	t.Parallel()
+
+	cfg := defaultAgentConfig()
+	cfg.Agent = "pi"
+	cfg.StreamView = streamViewRaw
+	r := &runner{opts: options{agentConfig: cfg}}
+
+	cmd, err := r.buildAgentCommand("prompt")
+	if err != nil {
+		t.Fatalf("buildAgentCommand returned unexpected error: %v", err)
+	}
+
+	if got, want := cmd.Args[:4], []string{"pi", "-p", "--model", "github-copilot/gpt-5.4:high"}; !slices.Equal(got, want) {
+		t.Fatalf("argv prefix mismatch:\n got: %v\nwant: %v", got, want)
 	}
 }
 

@@ -520,7 +520,7 @@ func (r *runner) runAgent(prompt, logPath string) (int, string, error) {
 
 	var output io.Writer
 	var consoleWriter *consoleStreamWriter
-	if r.opts.StreamView == streamViewPretty && (r.opts.Agent == "codex" || r.opts.Agent == "cursor-agent" || r.opts.Agent == "gemini") {
+	if r.opts.StreamView == streamViewPretty && (r.opts.Agent == "codex" || r.opts.Agent == "cursor-agent" || r.opts.Agent == "gemini" || r.opts.Agent == "pi") {
 		consoleWriter = newConsoleStreamWriter(os.Stdout, renderer)
 		output = io.MultiWriter(logFile, consoleWriter)
 	} else {

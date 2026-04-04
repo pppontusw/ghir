@@ -119,7 +119,7 @@ Terminal UI built on Bubble Tea. Three-phase state machine: **Configure** → **
 
 | File | Responsibility |
 |------|---------------|
-| `render.go` | Stream renderers: `codexPrettyRenderer`, `geminiPrettyRenderer`, `cursorAgentPrettyRenderer`, `rawRenderer`. Factory function `NewRenderer`. Suppresses noisy agent output lines (YOLO, credentials). |
+| `render.go` | Stream renderers: `codexPrettyRenderer`, `geminiPrettyRenderer`, `cursorAgentPrettyRenderer`, `piPrettyRenderer`, `rawRenderer`. Factory function `NewRenderer`. Suppresses noisy agent output lines (YOLO, credentials) and formats pi JSONL events into live thinking/chat/tool output. |
 
 ### 4.4 Package: `ghir/defaults`
 
@@ -147,9 +147,9 @@ Terminal UI built on Bubble Tea. Three-phase state machine: **Configure** → **
   - **codex**: `codex exec --json --dangerously-bypass-approvals-and-sandbox [--model ...] <prompt>`.
   - **gemini**: `gemini --output-format json --yolo [-m model] -p <prompt>`.
   - **cursor-agent**: `cursor-agent --print --output-format json --force [--model ...] <prompt>`.
-  - **pi**: `pi -p [--model ...] <prompt>`.
+  - **pi**: `pi --mode json [--model ...] <prompt>` for pretty streaming, or `pi -p [--model ...] <prompt>` for raw output.
 
-- **Stream views** — `--stream-view pretty` (default) or `raw`. For Codex, Cursor Agent, and Gemini, "pretty" uses a line-by-line JSON renderer to show condensed events. Other agents fall back to raw with a notice.
+- **Stream views** — `--stream-view pretty` (default) or `raw`. For Codex, Cursor Agent, Gemini, and pi, "pretty" uses a line-by-line JSON renderer to show condensed events. Other agents fall back to raw with a notice.
 
 ### 4.7 Session limit and error detection
 
